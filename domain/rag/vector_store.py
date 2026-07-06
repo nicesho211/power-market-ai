@@ -8,7 +8,7 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchValue,
+    Filter, FieldCondition, MatchValue, PayloadSchemaType,
 )
 from pathlib import Path
 from functools import lru_cache
@@ -83,6 +83,28 @@ def ensure_collection() -> None:
         count = client.count(name).count
         logger.info(f"[Qdrant] 기존 컬렉션 재사용: {count}개 청크")
         print(f"[Qdrant] 기존 컬렉션 재사용: {count}개 청크")
+
+    _ensure_payload_indexes(client, name)
+
+
+def _ensure_payload_indexes(client: QdrantClient, name: str) -> None:
+    """is_latest/document_type/버전 필터에 필요한 payload 인덱스를 보장한다.
+    Qdrant Cloud는 인덱스 없는 필드로 필터링(count/set_payload/scroll 등)하면
+    400 "Index required but not found"를 반환하므로 컬렉션 생성/재사용 시마다 확인한다.
+    이미 존재하면 예외를 무시한다(멱등)."""
+    for field_name, schema in (
+        ("is_latest", PayloadSchemaType.BOOL),
+        ("document_type", PayloadSchemaType.KEYWORD),
+        ("버전", PayloadSchemaType.KEYWORD),
+    ):
+        try:
+            client.create_payload_index(
+                collection_name=name,
+                field_name=field_name,
+                field_schema=schema,
+            )
+        except Exception as e:
+            logger.debug(f"[Qdrant] payload 인덱스 생성 스킵 ({field_name}): {e}")
 
 
 def get_collection_stats() -> dict:
