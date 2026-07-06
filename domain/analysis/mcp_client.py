@@ -18,6 +18,21 @@ logger = logging.getLogger(__name__)
 _SMP_CACHE: dict = {}
 _GEN_CACHE: dict = {}
 
+# 실패(429/데이터없음) 응답용 단기 캐시 — 짧은 TTL 동안은 재호출 없이 바로 빈 DF 반환
+# (실패는 캐시되지 않아 rate limit에 걸릴 때마다 매번 재시도하며 점점 느려지는 것을 방지)
+_SMP_FAIL_CACHE: dict = {}
+_GEN_FAIL_CACHE: dict = {}
+_FAIL_CACHE_TTL_SECONDS = 60
+
+# 실시간 수급현황 캐시 (5분 간격 데이터이므로 60초 캐시해도 안전)
+_DEMAND_CACHE: dict = {}
+_DEMAND_CACHE_TTL_SECONDS = 60
+
+
+def _is_fail_cached(cache: dict, key) -> bool:
+    failed_at = cache.get(key)
+    return failed_at is not None and (datetime.now() - failed_at).total_seconds() < _FAIL_CACHE_TTL_SECONDS
+
 
 def _validate_date(date: str) -> str | None:
     """날짜 유효성 사전 체크 — 문제 있으면 오류 메시지 반환, 정상이면 None"""
@@ -77,6 +92,9 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
     if cache_key in _SMP_CACHE:
         return _SMP_CACHE[cache_key]
 
+    if _is_fail_cached(_SMP_FAIL_CACHE, cache_key):
+        return pd.DataFrame(columns=["date", "hour", "smp", "region", "forecast_demand"])
+
     err_msg = _validate_date(date)
     if err_msg:
         logger.warning(f"[SMP 날짜 체크] {err_msg}")
@@ -87,18 +105,19 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
         "numOfRows": 24,
         "date": date
     }
-    
+
     data = _call_api(
         "https://apis.data.go.kr/B552115/SmpWithForecastDemand/getSmpWithForecastDemand",
         params
     )
-    
+
     items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
-    
+
     if not items:
         logger.warning(f"No SMP data for {date} with date param")
+        _SMP_FAIL_CACHE[cache_key] = datetime.now()
         return pd.DataFrame(columns=["date", "hour", "smp", "region", "forecast_demand"])
-    
+
     rows = []
     for item in items:
         rows.append({
@@ -112,6 +131,7 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if not df.empty:
         _SMP_CACHE[cache_key] = df  # 성공 결과만 캐시
+        _SMP_FAIL_CACHE.pop(cache_key, None)
     return df
 
 
@@ -130,6 +150,9 @@ def fetch_generation(date: str) -> pd.DataFrame:
     if date in _GEN_CACHE:
         return _GEN_CACHE[date]
 
+    if _is_fail_cached(_GEN_FAIL_CACHE, date):
+        return pd.DataFrame(columns=["date", "hour", "source", "gen_mw"])
+
     err_msg = _validate_date(date)
     if err_msg:
         logger.warning(f"[발전량 날짜 체크] {err_msg}")
@@ -140,16 +163,17 @@ def fetch_generation(date: str) -> pd.DataFrame:
         "numOfRows": 24,
         "baseDate": date
     }
-    
+
     data = _call_api(
         "https://apis.data.go.kr/B552115/PwrAmountByGen/getPwrAmountByGen",
         params
     )
-    
+
     items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
-    
+
     if not items:
         logger.warning(f"No generation data for {date} with baseDate param")
+        _GEN_FAIL_CACHE[date] = datetime.now()
         return pd.DataFrame(columns=["date", "hour", "source", "gen_mw"])
     
     SOURCE_MAP = {
@@ -180,39 +204,47 @@ def fetch_generation(date: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if not df.empty:
         _GEN_CACHE[date] = df  # 성공 결과만 캐시
+        _GEN_FAIL_CACHE.pop(date, None)
     return df
 
 
 def fetch_current_demand() -> pd.DataFrame:
     """
-    현재 전력수급현황 조회 (실시간, 캐시 미적용)
-    
+    현재 전력수급현황 조회 (실시간, 60초 캐시 — 원본 데이터가 5분 간격이라 안전)
+
     Returns:
         pd.DataFrame: 현재 수급현황
         컬럼: [datetime, demand_mw, supply_mw, reserve_mw, reserve_rate]
     """
+    cached_at = _DEMAND_CACHE.get("at")
+    if cached_at and (datetime.now() - cached_at).total_seconds() < _DEMAND_CACHE_TTL_SECONDS:
+        return _DEMAND_CACHE["data"]
+
     data = _call_api(
         "https://openapi.kpx.or.kr/openapi/sukub5mToday/getSukub5mToday",
         {}
     )
-    
+
     items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
-    
+
     if not items:
         logger.warning("No current demand data")
         return pd.DataFrame(
             columns=["datetime", "demand_mw", "supply_mw", "reserve_mw", "reserve_rate"]
         )
-    
+
     item = items[0] if isinstance(items, list) else items
-    
-    return pd.DataFrame([{
+
+    result = pd.DataFrame([{
         "datetime": item.get("baseDatetime", ""),
         "demand_mw": float(item.get("curr", 0)),
         "supply_mw": float(item.get("suppAbility", 0)),
         "reserve_mw": float(item.get("suppReserve", 0)),
         "reserve_rate": float(item.get("suppReserveRate", 0))
     }])
+    _DEMAND_CACHE["data"] = result
+    _DEMAND_CACHE["at"] = datetime.now()
+    return result
 
 
 def fetch_smp_range(start_date: str, end_date: str, area: str = "01") -> pd.DataFrame:

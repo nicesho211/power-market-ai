@@ -67,7 +67,7 @@ def resolve_date_range(date_filter: dict) -> Union[List[str], Dict[str, List[str
             n = 3
         return [
             (today - timedelta(days=i)).strftime("%Y%m%d")
-            for i in range(1, n + 1)
+            for i in range(n, 0, -1)
         ]
 
     elif period_type == "this_week":

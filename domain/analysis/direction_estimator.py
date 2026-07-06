@@ -180,6 +180,11 @@ class DirectionEstimator:
 
         return results
 
+    def warm_up(self, reference_date: str | None = None) -> None:
+        """앱 시작 시 임계값 캐시를 미리 채운다 (첫 사용자 질의의 지연 방지)"""
+        ref = reference_date or datetime.now().strftime("%Y%m%d")
+        self._get_cached_thresholds(ref)
+
     def invalidate_threshold_cache(self) -> None:
         """임계값 캐시 강제 초기화 (수동 갱신 시 호출)"""
         DirectionEstimator._threshold_cache = {}

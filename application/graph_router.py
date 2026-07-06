@@ -523,8 +523,8 @@ class GraphRouter:
                     })
                     return state
 
-                # 가장 최근 성공 날짜 기준으로 direction_result 사용
-                state["direction_result"] = batch_results[success_dates[0]]
+                # 가장 최근 성공 날짜 기준으로 direction_result 사용 (date_list 정렬 순서에 의존하지 않음)
+                state["direction_result"] = batch_results[max(success_dates)]
 
                 detail_msg = f"{len(success_dates)}일 성공"
                 if failed_dates:

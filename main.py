@@ -214,11 +214,22 @@ hr { border-color: #F1F5F9 !important; }
 
 @st.cache_resource(show_spinner="⚡ Power Market AI 초기화 중...")
 def init_resources():
-    """앱 시작 시 Qdrant 컬렉션 확인 + LLM/임베딩 클라이언트 웜업"""
+    """앱 시작 시 Qdrant 컬렉션 확인 + LLM/임베딩 클라이언트 + SMP 임계값 웜업"""
     ensure_collection()
     get_llm()
     get_embeddings()
+    _warm_up_smp_thresholds()
     return True
+
+
+def _warm_up_smp_thresholds():
+    """SMP 방향성 임계값(과거 7일 baseline)을 앱 시작 시 미리 계산해둔다.
+    이걸 안 하면 첫 SMP 분석 질의가 baseline 계산 때문에 느려진다."""
+    from domain.analysis.direction_estimator import get_direction_estimator
+    try:
+        get_direction_estimator().warm_up()
+    except Exception:
+        logger.exception("SMP 임계값 warm-up 실패 (첫 질의 시 재계산됩니다)")
 
 
 def render_top_metrics():
