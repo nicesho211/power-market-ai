@@ -166,19 +166,19 @@ def run_indexing_stream(
         # ── Step 5b: 임베딩 — ThreadPoolExecutor(max_workers=2) 병렬 처리 ──
         from infrastructure.llm_client import get_embeddings
         embeddings_model = get_embeddings()
-        batch_size = 50   # 50개씩 → 더 자주 진행률 갱신
+        batch_size = 100   # 100개씩 → 더 자주 진행률 갱신
         batches = [documents_list[i:i + batch_size]
                    for i in range(0, total_chunks, batch_size)]
         n_batches = len(batches)
 
         yield _prog("embed", 0, total_chunks,
-                    f"🔢 임베딩 시작: {total_chunks:,}개 청크 / {n_batches}배치 (병렬 2)")
+                    f"🔢 임베딩 시작: {total_chunks:,}개 청크 / {n_batches}배치 (병렬 4)")
 
         all_embeddings: list = [None] * n_batches
         completed_chunks = 0
         t5b = time.time()
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             future_to_idx = {
                 pool.submit(embeddings_model.embed_documents, batch): i
                 for i, batch in enumerate(batches)
@@ -209,7 +209,7 @@ def run_indexing_stream(
             embeddings=flat_embeddings,
             ids=ids,
             metadatas=metadatas,
-            batch_size=100,
+            batch_size=300,
         )
         failed_chunks = total_chunks - success_chunks
         t5c_done = round(time.time() - t5c, 1)
