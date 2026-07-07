@@ -17,7 +17,7 @@ from langchain_classic.retrievers import EnsembleRetriever
 from domain.rag.vector_store import get_vector_store, VectorStore
 from config.settings import get_settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("RAG")
 
 # BM25 문서 풀 캐시 (filter JSON → list[dict])
 _bm25_cache: Dict[str, List[Dict]] = {}
@@ -91,7 +91,7 @@ def _load_bm25_docs(
         logger.error(f"BM25 문서 로드 실패: {e}")
 
     _bm25_cache[cache_key] = docs
-    logger.info(f"BM25 문서 풀 로드: {len(docs)}개 (filter={cache_key[:50]})")
+    logger.info(f"[RAG] BM25 문서 풀 로드: {len(docs)}개 (filter={cache_key[:50]})")
     return docs
 
 
@@ -141,6 +141,8 @@ class Retriever:
             else:
                 where = {"$and": [where, {"document_type": document_type}]}
 
+        logger.info(f"[RAG] Hybrid Search 시작 | query={query[:50]} | filter={where}")
+
         try:
             # ── 벡터 검색 Retriever ─────────────────────────────────────
             vector_retriever = _VectorStoreRetriever(
@@ -154,7 +156,7 @@ class Retriever:
             if not bm25_docs:
                 # 문서 풀 없으면 벡터 검색만
                 results = self.vector_store.search(query, top_k=k, where=where)
-                logger.info(f"Vector-only search (no BM25 pool): {len(results)}건")
+                logger.info(f"[RAG] Vector-only search (BM25 풀 없음) | {len(results)}건")
                 return results
 
             bm25_retriever = BM25Retriever.from_texts(
@@ -162,6 +164,7 @@ class Retriever:
                 metadatas=[d["metadata"] for d in bm25_docs],
                 k=k,
             )
+            logger.info(f"[RAG] BM25 검색 준비 완료 | 후보 {len(bm25_docs)}건")
 
             # ── Ensemble (RRF 병합) ─────────────────────────────────────
             ensemble = EnsembleRetriever(
@@ -170,7 +173,12 @@ class Retriever:
             )
             lc_results = ensemble.invoke(query)[:k]
             results = _docs_to_hybrid_results(lc_results)
-            logger.info(f"Hybrid search returned {len(results)}건")
+            logger.info(f"[RAG] Hybrid 통합 결과 | {len(results)}건")
+            if results:
+                top_meta = results[0].get("metadata", {})
+                logger.info(
+                    f"[RAG] 상위 조문: {top_meta.get('조문번호', '없음')} | 페이지: {top_meta.get('페이지', 0)}"
+                )
             return results
 
         except Exception as e:

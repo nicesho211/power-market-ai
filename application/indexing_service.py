@@ -22,7 +22,7 @@ from domain.rag.document_loader import get_document_loader, detect_document_type
 from domain.rag.chunker import get_chunker
 from domain.rag.vector_store import get_vector_store
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("INDEX")
 
 
 def run_indexing_stream(
@@ -39,6 +39,7 @@ def run_indexing_stream(
         {"type":"result",   "success":bool, ...결과 필드}
     """
     t_start = time.time()
+    logger.info(f"[INDEX] 인덱싱 시작 | 파일: {filename} | 버전: {version or '자동추출 예정'}")
     settings = get_settings()
     pdf_dir = Path(settings.pdf_path)
     pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -109,12 +110,13 @@ def run_indexing_stream(
             return
 
         t2_done = round(time.time() - t2, 1)
-        logger.info(f"[Step 2] 추출 완료: {len(extracted_text):,}자 ({t2_done}초)")
+        logger.info(f"[INDEX] 텍스트 추출 완료 | {len(extracted_text):,}자 | {t2_done}초")
 
         # 조문 감지율
         matches = re.findall(r"제\s*\d+\.\d+(?:\.\d+)*\s*조", extracted_text)
         total_paragraphs = max(extracted_text.count("\n\n"), 1)
         detection_rate = len(matches) / total_paragraphs
+        logger.info(f"[INDEX] 조문 감지율: {detection_rate:.1%}")
 
         if not document_type:
             document_type = detect_document_type(filename, extracted_text)
@@ -135,7 +137,7 @@ def run_indexing_stream(
             return
 
         total_chunks = len(chunks)
-        logger.info(f"[Step 3] 청킹 완료: {total_chunks}개 ({t3_done}초)")
+        logger.info(f"[INDEX] 청킹 완료 | {total_chunks:,}개 청크 | {t3_done}초")
         yield _prog("chunk", 2, 4, f"✅ 청킹 완료: {total_chunks:,}개 ({t3_done}초)")
 
         # 사용자 입력 버전 우선, 없으면 파일명에서 추출
@@ -191,6 +193,10 @@ def run_indexing_stream(
                     logger.error(f"배치 {idx} 임베딩 실패: {e}")
                     all_embeddings[idx] = [[0.0] * 3072] * len(batches[idx])
                 completed_chunks += len(batches[idx])
+                logger.info(
+                    f"[INDEX] 임베딩 {min(completed_chunks, total_chunks)}/{total_chunks} "
+                    f"({min(completed_chunks, total_chunks)/total_chunks:.0%})"
+                )
                 yield _prog(
                     "embed", min(completed_chunks, total_chunks), total_chunks,
                     f"🔢 임베딩: {completed_chunks:,}/{total_chunks:,}개 ({completed_chunks/total_chunks:.0%})"
@@ -198,7 +204,7 @@ def run_indexing_stream(
 
         flat_embeddings = [vec for batch_vecs in all_embeddings for vec in batch_vecs]
         t5b_done = round(time.time() - t5b, 1)
-        logger.info(f"[Step 5b] 임베딩 완료: {total_chunks}개 ({t5b_done}초)")
+        logger.info(f"[INDEX] 임베딩 완료 | {total_chunks:,}개 | {t5b_done}초")
 
         # ── Step 5c: Qdrant 저장 ────────────────────────────────────────────
         yield _prog("store", 3, 4, f"💾 Qdrant 저장 중... ({total_chunks:,}개)")
@@ -221,7 +227,8 @@ def run_indexing_stream(
             return
 
         elapsed = round(time.time() - t_start, 1)
-        logger.info(f"[Step 5c] 저장 완료: {success_chunks}개 ({t5c_done}초)")
+        logger.info(f"[INDEX] Qdrant 저장 완료 | 성공: {success_chunks:,}개 | {t5c_done}초")
+        logger.info(f"[INDEX] 인덱싱 총 소요시간: {elapsed}초")
 
         msg = (
             f"인덱싱 완료 — 버전: {version}, 종류: {document_type}, "
@@ -244,7 +251,7 @@ def run_indexing_stream(
         }
 
     except Exception as e:
-        logger.error(f"[indexing] 오류: {e}", exc_info=True)
+        logger.error(f"[INDEX] 인덱싱 실패: {e}", exc_info=True)
         if not _pre_existed:
             save_path.unlink(missing_ok=True)
         yield _fail(f"인덱싱 중 오류 발생: {e}")

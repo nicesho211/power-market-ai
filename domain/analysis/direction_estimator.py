@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from domain.analysis.mcp_client import fetch_smp, fetch_generation
 from datetime import datetime, timedelta
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("SCORE")
 
 
 class DirectionEstimator:
@@ -71,6 +71,7 @@ class DirectionEstimator:
 
             # 방향성 결정
             direction, emoji = self._determine_direction(score)
+            logger.info(f"[SCORE] 최종: {score}점 → {direction}{emoji}")
 
             return {
                 "direction": direction,
@@ -164,6 +165,7 @@ class DirectionEstimator:
                 indicators = self._calculate_indicators(smp_df, gen_df, thresholds)
                 score = self._calculate_score(indicators)
                 direction, emoji = self._determine_direction(score)
+                logger.info(f"[SCORE] {d} 최종: {score}점 → {direction}{emoji}")
 
                 results[d] = {
                     "direction": direction,
@@ -288,35 +290,39 @@ class DirectionEstimator:
         Python 고정 로직으로 스코어 계산
         LLM이 직접 방향성을 판단하면 안 됨!
         """
+        logger.info("[SCORE] 스코어링 시작")
         score = 0
-        
+
         # 전력수요: 임계값 초과 시 +1점
         demand_str = indicators["전력수요"]["현재"]
         demand_val = float(demand_str.replace(",", "").replace("MW", "").strip())
         threshold_str = indicators["전력수요"]["임계값"]
         threshold_val = float(threshold_str.replace(",", "").replace("MW", "").strip())
-        
-        if demand_val > threshold_val:
-            score += 1
-        
+
+        demand_score = 1 if demand_val > threshold_val else 0
+        score += demand_score
+        logger.info(f"[SCORE] 수요: {demand_val:,.0f}MW / 임계값: {threshold_val:,.0f}MW → {demand_score}점")
+
         # LNG 비중: 임계값 초과 시 +1점
         lng_str = indicators["LNG발전비중"]["현재"].replace("%", "").strip()
         lng_val = float(lng_str)
         lng_threshold_str = indicators["LNG발전비중"]["임계값"].replace("%", "").strip()
         lng_threshold_val = float(lng_threshold_str)
-        
-        if lng_val > lng_threshold_val:
-            score += 1
-        
+
+        lng_score = 1 if lng_val > lng_threshold_val else 0
+        score += lng_score
+        logger.info(f"[SCORE] LNG비중: {lng_val:.1f}% / 평균: {lng_threshold_val:.1f}% → {lng_score}점")
+
         # 신재생 비중: 임계값 미만 시 +1점
         renewable_str = indicators["신재생발전량"]["현재"].replace("%", "").strip()
         renewable_val = float(renewable_str)
         renewable_threshold_str = indicators["신재생발전량"]["임계값"].replace("%", "").strip()
         renewable_threshold_val = float(renewable_threshold_str)
-        
-        if renewable_val < renewable_threshold_val:
-            score += 1
-        
+
+        renewable_score = 1 if renewable_val < renewable_threshold_val else 0
+        score += renewable_score
+        logger.info(f"[SCORE] 신재생: {renewable_val:.1f}% / 평균: {renewable_threshold_val:.1f}% → {renewable_score}점")
+
         return score
     
     def _determine_direction(self, score: int) -> tuple:

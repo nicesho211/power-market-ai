@@ -51,5 +51,8 @@ data/pdf/*.pdf
 # Streamlit
 .streamlit/
 
+# 로그
+logs/
+
 # LangSmith
 .langchain/

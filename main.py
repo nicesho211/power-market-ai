@@ -4,6 +4,9 @@
 전력시장 AI 어시스턴트의 메인 엔트리 포인트입니다.
 """
 
+from config.logging_config import setup_logging
+setup_logging()
+
 import streamlit as st
 from presentation.sidebar import render_sidebar, show_instructions
 from presentation.chat_ui import render_chat_ui, render_conversation_sidebar
@@ -14,9 +17,7 @@ from domain.rag.vector_store import ensure_collection
 from infrastructure.llm_client import get_llm, get_embeddings
 import logging
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("APP")
 
 # Streamlit 페이지 설정
 st.set_page_config(
@@ -215,10 +216,12 @@ hr { border-color: #F1F5F9 !important; }
 @st.cache_resource(show_spinner="⚡ Power Market AI 초기화 중...")
 def init_resources():
     """앱 시작 시 Qdrant 컬렉션 확인 + LLM/임베딩 클라이언트 + SMP 임계값 웜업"""
+    logger.info("⚡ Power Market AI Assistant 시작")
     ensure_collection()
     get_llm()
     get_embeddings()
     _warm_up_smp_thresholds()
+    logger.info("✅ 리소스 초기화 완료")
     return True
 
 

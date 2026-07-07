@@ -3,21 +3,26 @@ Azure OpenAI LLM 및 임베딩 클라이언트 모듈
 AzureChatOpenAI와 AzureOpenAIEmbeddings를 싱글톤으로 관리합니다.
 """
 
+import logging
 from functools import lru_cache
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from config.settings import get_settings
+
+logger = logging.getLogger("LLM")
 
 
 @lru_cache()
 def get_llm() -> AzureChatOpenAI:
     settings = get_settings()
-    return AzureChatOpenAI(
+    llm = AzureChatOpenAI(
         azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
         api_key=settings.AZURE_OPENAI_API_KEY,
         api_version=settings.AZURE_OPENAI_API_VERSION,
         azure_deployment=settings.OPENAI_MODEL,
         temperature=0.1
     )
+    logger.info(f"[LLM] AzureChatOpenAI 초기화 완료 | model={settings.OPENAI_MODEL}")
+    return llm
 
 
 @lru_cache()
@@ -36,12 +41,14 @@ def get_llm_for_planning() -> AzureChatOpenAI:
 @lru_cache()
 def get_embeddings() -> AzureOpenAIEmbeddings:
     settings = get_settings()
-    return AzureOpenAIEmbeddings(
+    embeddings = AzureOpenAIEmbeddings(
         azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
         api_key=settings.AZURE_OPENAI_API_KEY,
         api_version=settings.AZURE_OPENAI_API_VERSION,
         azure_deployment=settings.EMBEDDING_MODEL
     )
+    logger.info(f"[EMBED] AzureOpenAIEmbeddings 초기화 완료 | model={settings.EMBEDDING_MODEL}")
+    return embeddings
 
 
 def generate_rag_answer(query: str, context: str, history: list) -> dict:

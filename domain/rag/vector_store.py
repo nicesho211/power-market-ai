@@ -19,7 +19,7 @@ from typing import List, Dict, Optional
 from config.settings import get_settings
 from domain.rag.embedder import get_embedder
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("QDRANT")
 
 
 def _str_to_point_id(s: str) -> str:
@@ -77,12 +77,10 @@ def ensure_collection() -> None:
             collection_name=name,
             vectors_config=VectorParams(size=settings.VECTOR_SIZE, distance=Distance.COSINE),
         )
-        logger.info(f"[Qdrant] 새 컬렉션 생성: {name}")
-        print(f"[Qdrant] 새 컬렉션 생성: {name}")
+        logger.info(f"[QDRANT] 새 컬렉션 생성: {name}")
     else:
         count = client.count(name).count
-        logger.info(f"[Qdrant] 기존 컬렉션 재사용: {count}개 청크")
-        print(f"[Qdrant] 기존 컬렉션 재사용: {count}개 청크")
+        logger.info(f"[QDRANT] 기존 컬렉션 재사용: {count:,}개 청크")
 
     _ensure_payload_indexes(client, name)
 
@@ -174,6 +172,7 @@ class VectorStore:
         batch_size: int = 100,
     ) -> int:
         """사전 계산된 임베딩으로 Qdrant에 저장. batch_size개씩 배치 처리."""
+        logger.info(f"[QDRANT] 저장 시작 | 총 {len(documents):,}개")
         added = 0
         for start in range(0, len(documents), batch_size):
             end = min(start + batch_size, len(documents))
@@ -194,9 +193,10 @@ class VectorStore:
             try:
                 self.client.upsert(collection_name=self.collection_name, points=points)
                 added += end - start
-                logger.info(f"Qdrant upsert {end}/{len(documents)}")
+                logger.info(f"[QDRANT] upsert {end}/{len(documents)} 완료")
             except Exception as e:
                 logger.error(f"Qdrant 배치 저장 실패 ({start}~{end}): {e}", exc_info=True)
+        logger.info(f"[QDRANT] 저장 완료 | 성공: {added:,}개")
         return added
 
     def add_documents(
@@ -221,6 +221,7 @@ class VectorStore:
         where_document: Optional[Dict] = None,
     ) -> List[Dict]:
         """벡터 유사도 검색 (Qdrant) — query_points() 사용 (>=1.12)"""
+        logger.info(f"[QDRANT] 벡터 검색 | top_k={top_k} | filter={where}")
         try:
             query_vector = self.embedder.embed_text(query)
             qdrant_filter = _build_qdrant_filter(where)
@@ -260,6 +261,7 @@ class VectorStore:
                         "distance": 1 - hit.score,  # cosine similarity → distance
                     }
                 )
+            logger.info(f"[QDRANT] 검색 결과: {len(formatted)}건")
             return formatted
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -287,6 +289,9 @@ class VectorStore:
 
     def update_latest_flag(self, new_version: str, document_type: str) -> None:
         """같은 document_type 내에서만 is_latest를 False로 전환"""
+        logger.info(
+            f"[QDRANT] is_latest 플래그 업데이트 | document_type={document_type} | new_version={new_version}"
+        )
         try:
             filter_obj = Filter(
                 must=[
@@ -305,10 +310,7 @@ class VectorStore:
                 payload={"is_latest": False},
                 points=filter_obj,
             )
-            logger.info(
-                f"is_latest → False for {count_before} chunks "
-                f"(document_type={document_type}, new_version={new_version})"
-            )
+            logger.info(f"[QDRANT] 기존 {count_before}개 → is_latest=False 전환")
         except Exception as e:
             logger.error(f"Failed to update latest flag: {e}")
             raise

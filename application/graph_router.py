@@ -5,12 +5,13 @@ LangGraph 워크플로우 라우터
 AgentState 기반으로 상태를 추적합니다.
 """
 
-from typing import TypedDict, List, Dict, Any, Optional
+from typing import TypedDict, List, Dict, Any, Optional, Annotated
 from langgraph.graph import StateGraph
 from langgraph.types import Send
 import logging
 import json
 import re
+import time
 import pandas as pd
 
 from application.intent_classifier import get_intent_classifier
@@ -25,7 +26,7 @@ from infrastructure.prompt_manager import PromptManager
 from datetime import datetime
 from domain.analysis.date_resolver import resolve_date_range
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("GRAPH")
 
 
 def _format_diff_unavailable(result: Dict) -> str:
@@ -68,28 +69,43 @@ SKILLS: Dict[str, Dict] = {
 SKILL_TO_NODE: Dict[str, str] = {name: info["node"] for name, info in SKILLS.items()}
 
 
+def _prefer_new(current: Any, incoming: Any) -> Any:
+    """병렬(Send) 노드가 동시에 같은 채널에 값을 반환할 때의 충돌 리듀서.
+
+    executor_router가 parallel=True일 때 Send로 rag_node/analysis_fixed_node 등을
+    동시 실행하면, 각 노드가 (자신이 건드리지 않은 필드까지 포함해) state 전체를
+    반환하기 때문에 LangGraph 기본 채널(단일 writer만 허용)은
+    `InvalidUpdateError: Can receive only one value per step`로 죽는다.
+    두 브랜치가 반환하는 미변경 필드 값은 항상 동일하므로, 값이 있는 쪽(진짜로
+    갱신된 값)을 우선 채택하면 병렬 실행에서도 안전하게 병합된다.
+    """
+    return incoming if incoming else current
+
+
 class AgentState(TypedDict):
     """LangGraph 에이전트 상태"""
-    query: str
-    intent: str
-    confidence: float
-    search_filter: dict
-    rag_result: str
-    analysis_result: dict
-    direction_result: dict
-    final_answer: str
-    needs_clarification: bool
-    conversation_history: List[Dict]
-    progress_steps: List[Dict]
+    query: Annotated[str, _prefer_new]
+    intent: Annotated[str, _prefer_new]
+    confidence: Annotated[float, _prefer_new]
+    search_filter: Annotated[dict, _prefer_new]
+    rag_result: Annotated[str, _prefer_new]
+    analysis_result: Annotated[dict, _prefer_new]
+    direction_result: Annotated[dict, _prefer_new]
+    final_answer: Annotated[str, _prefer_new]
+    needs_clarification: Annotated[bool, _prefer_new]
+    conversation_history: Annotated[List[Dict], _prefer_new]
+    progress_steps: Annotated[List[Dict], _prefer_new]
     # 에러 핸들링 필드 (A섹션)
-    error: Optional[Dict]
+    error: Annotated[Optional[Dict], _prefer_new]
     # 날짜 필터 필드 (B섹션)
-    date_filter: Optional[Dict]
-    clarify_message: str
+    date_filter: Annotated[Optional[Dict], _prefer_new]
+    clarify_message: Annotated[str, _prefer_new]
     # Agent Planning 관련 신규 필드
-    plan: Optional[Dict]
+    plan: Annotated[Optional[Dict], _prefer_new]
     # {"skills_needed": [...], "parallel": bool, "execution_order": [...], "reason": str}
-    completed_skills: List[str]
+    completed_skills: Annotated[List[str], _prefer_new]
+    # 로그 소요시간 계산용 (run() 시작 시각)
+    _start_time: Annotated[Optional[float], _prefer_new]
 
 
 class GraphRouter:
@@ -178,7 +194,8 @@ class GraphRouter:
     
     def _classify_node(self, state: AgentState) -> AgentState:
         """Step 1: 질문 분류"""
-        logger.info("=== Classify Node ===")
+        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"[CHAT] 사용자 질문: {state['query']}")
 
         try:
             classification = self.classifier.classify(state["query"])
@@ -192,6 +209,10 @@ class GraphRouter:
                 "start_date": None,
                 "end_date": None
             })
+
+            logger.info(f"[CLASSIFY] intent={state['intent']} | confidence={state['confidence']:.2f}")
+            logger.info(f"[CLASSIFY] 분류 근거: {classification.get('reason', '')}")
+            logger.info(f"[CLASSIFY] date_filter: {state.get('date_filter', {})}")
 
             # 모호한 기간 표현 → clarify로 전환 (B.2.6)
             if state["date_filter"].get("period_type") == "ambiguous":
@@ -240,7 +261,7 @@ class GraphRouter:
     
     def _rag_node(self, state: AgentState) -> AgentState:
         """단순 규정 Q&A"""
-        logger.info("=== RAG Node ===")
+        logger.info(f"[RAG] Hybrid Search 시작 | query={state['query'][:50]} | filter={state.get('search_filter', {})}")
 
         try:
             # Step 2: 문서 검색
@@ -248,6 +269,14 @@ class GraphRouter:
                 query=state["query"],
                 where=state["search_filter"] or {"is_latest": True}
             )
+
+            logger.info(f"[RAG] 검색 완료 | {len(results) if results else 0}건")
+            if results:
+                top_meta = results[0].get("metadata", {})
+                logger.info(
+                    f"[RAG] 상위 결과: {top_meta.get('조문번호', '')} "
+                    f"(distance={results[0].get('distance', 0):.2f})"
+                )
 
             if not results:
                 state["error"] = {
@@ -461,14 +490,19 @@ class GraphRouter:
     
     def _analysis_fixed_node(self, state: AgentState) -> AgentState:
         """SMP 방향성 추정 (정형 파이프라인) — 다중 날짜 지원"""
-        logger.info("=== Analysis Fixed Node ===")
+        logger.info("[ANALYSIS] 날짜 계산 시작")
 
         try:
             # date_filter에서 날짜 리스트 계산 (없으면 오늘)
             date_filter = state.get("date_filter") or {"period_type": "today"}
+            logger.info(f"[ANALYSIS] period_type={date_filter.get('period_type', '')}")
             date_list = resolve_date_range(date_filter)
             if not date_list:
                 date_list = [datetime.now().strftime("%Y%m%d")]
+
+            logger.info(
+                f"[ANALYSIS] 분석 날짜: {date_list[:3]}{'...' if len(date_list) > 3 else ''}"
+            )
 
             state["progress_steps"].append({
                 "step": len(state["progress_steps"]) + 1,
@@ -580,12 +614,15 @@ class GraphRouter:
     def _analysis_plan_node(self, state: AgentState) -> AgentState:
         """비정형 데이터 분석 — multi_range(두 기간 이상 비교)는 실제 데이터 수집·비교,
         그 외는 LLM Planning (실패 시 Fixed Pipeline으로 폴백)"""
-        logger.info("=== Analysis Plan Node ===")
+        logger.info("[ANALYSIS] 날짜 계산 시작")
 
         date_filter = state.get("date_filter") or {}
+        logger.info(f"[ANALYSIS] period_type={date_filter.get('period_type', '')}")
         date_result = resolve_date_range(date_filter)
 
         if isinstance(date_result, dict) and date_result:
+            labels = list(date_result.keys())
+            logger.info(f"[ANALYSIS] 비교 기간: {labels}")
             return self._analysis_plan_multi_range(state, date_result)
 
         try:
@@ -746,7 +783,7 @@ class GraphRouter:
 
     def _planning_node(self, state: AgentState) -> AgentState:
         """LLM이 질문을 분석해서 실행 계획을 수립하는 Node."""
-        logger.info("=== Planning Node ===")
+        logger.info("[PLANNING] LLM Plan 수립 시작")
 
         skills_desc = "\n".join(
             f"- {name}: {info['description']}" for name, info in SKILLS.items()
@@ -784,6 +821,10 @@ class GraphRouter:
                 "reason": f"Plan 파싱 실패 → 기본값(RAG+분석 병렬) 사용",
             }
 
+        logger.info(f"[PLANNING] skills={plan.get('skills_needed', [])}")
+        logger.info(f"[PLANNING] parallel={plan.get('parallel', False)}")
+        logger.info(f"[PLANNING] 판단근거: {plan.get('reason', '')}")
+
         state["plan"] = plan
         state["completed_skills"] = []
         state["progress_steps"].append({
@@ -800,10 +841,11 @@ class GraphRouter:
 
     def _executor_node(self, state: AgentState) -> AgentState:
         """Plan을 읽고 실행 방식을 결정하는 Node."""
-        logger.info("=== Executor Node ===")
         plan = state.get("plan") or {}
         skills = plan.get("skills_needed", ["rag_skill", "analysis_skill"])
         parallel = plan.get("parallel", True)
+
+        logger.info(f"[EXECUTOR] {'병렬' if parallel else '순차'} 실행 시작 → {skills}")
 
         state["progress_steps"].append({
             "step": len(state["progress_steps"]) + 1,
@@ -836,7 +878,14 @@ class GraphRouter:
 
     def _merge_node(self, state: AgentState) -> AgentState:
         """병렬/순차 실행된 스킬 결과를 통합하는 Node."""
-        logger.info("=== Merge Node ===")
+        has_rag = bool(state.get("rag_result"))
+        has_analysis = bool(state.get("analysis_result") or state.get("direction_result"))
+        logger.info(
+            f"[MERGE] rag_result={'✅' if has_rag else '❌'} | "
+            f"analysis_result={'✅' if has_analysis else '❌'}"
+        )
+        logger.info("[MERGE] 결과 통합 완료")
+
         detail_parts = []
         if state.get("rag_result"):
             detail_parts.append("규정 검색 결과 수신")
@@ -880,12 +929,15 @@ class GraphRouter:
     
     def _format_output_node(self, state: AgentState) -> AgentState:
         """출력 포맷팅 — error 존재 시 오류 전용 템플릿 출력"""
-        logger.info("=== Format Output Node ===")
+        logger.info("[FORMAT] 최종 답변 생성 시작")
 
         try:
             # 오류 전용 템플릿 (error 필드 존재 시)
             if state.get("error"):
                 error = state["error"]
+                logger.error(f"[ERROR] node={error.get('node')} | stage={error.get('stage')}")
+                logger.error(f"[ERROR] reason={error.get('reason')}")
+                logger.error(f"[ERROR] recoverable={error.get('recoverable')}")
                 user_msg = error.get("message", "")
                 if not user_msg:
                     user_msg = ("잠시 후 다시 시도하거나 관리자에게 문의해주세요."
@@ -906,6 +958,9 @@ class GraphRouter:
                     "status": "완료",
                     "detail": f"오류 단계: {error.get('stage', '')}"
                 })
+                elapsed = round(time.time() - (state.get("_start_time") or time.time()), 1)
+                logger.info(f"[FORMAT] 답변 생성 완료 | 소요시간: {elapsed}초")
+                logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 return state
 
             # 정상 출력 (기존 로직 유지)
@@ -946,8 +1001,11 @@ class GraphRouter:
                 f"📎 면책\n본 시스템은 참고용이며, 오류 발생 시 직접 데이터를 확인하시기 바랍니다."
             )
 
+        elapsed = round(time.time() - (state.get("_start_time") or time.time()), 1)
+        logger.info(f"[FORMAT] 답변 생성 완료 | 소요시간: {elapsed}초")
+        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return state
-    
+
     def _format_direction_result(self, result: Dict) -> str:
         """방향성 결과 포맷팅"""
         output = f"📊 SMP 방향성 분석\n"
@@ -992,6 +1050,7 @@ class GraphRouter:
             clarify_message="",
             plan=None,
             completed_skills=[],
+            _start_time=time.time(),
         )
         
         # 그래프 실행

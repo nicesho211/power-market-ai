@@ -4,11 +4,14 @@ SMP, 발전량, 전력수급현황 데이터를 On-the-fly로 수집합니다.
 DB 저장 없이 즉시 처리 후 반환합니다.
 """
 
+import logging
 import requests
 import pandas as pd
 from functools import lru_cache
 from datetime import datetime, timedelta
 from config.settings import get_settings
+
+logger = logging.getLogger("API")
 
 
 def _call_api(base_url: str, params: dict) -> dict:
@@ -25,7 +28,7 @@ def _call_api(base_url: str, params: dict) -> dict:
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        print(f"[API 오류] {base_url}: {e}")
+        logger.warning(f"[API 오류] {base_url}: {e}")
         return {}
 
 
@@ -46,10 +49,12 @@ def _validate_date(date: str) -> str | None:
 @lru_cache(maxsize=32)
 def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
     """SMP 데이터 조회 (date 파라미터명 사용)"""
+    logger.info(f"[API] fetch_smp 호출 | date={date}")
+
     # 사전 날짜 유효성 체크 (미래/과거 1년 초과 시 API 호출 안 함)
     err_msg = _validate_date(date)
     if err_msg:
-        print(f"[SMP 날짜 체크] {err_msg}")
+        logger.warning(f"[API] SMP 날짜 체크 실패 | {err_msg}")
         return pd.DataFrame(columns=["date", "hour", "smp", "region", "forecast_demand"])
 
     params = {
@@ -63,7 +68,7 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
     )
     items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
     if not items:
-        print(f"[SMP 파싱] {date} 데이터 없음")
+        logger.warning(f"[API] SMP 응답 없음 | date={date}")
         return pd.DataFrame(columns=["date", "hour", "smp", "region", "forecast_demand"])
     rows = []
     for item in items:
@@ -74,16 +79,20 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
             "region": item.get("areaName", "육지" if area == "01" else "제주"),
             "forecast_demand": float(item.get("slfd", item.get("fcstDemand", 0)))
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    logger.info(f"[API] SMP 응답 수신 | {len(df)}개 시간대 | 평균={df['smp'].mean():.1f} 원/kWh")
+    return df
 
 
 @lru_cache(maxsize=32)
 def fetch_generation(date: str) -> pd.DataFrame:
     """발전원별 발전량 조회 (baseDate 파라미터명 사용 — fetch_smp의 date와 다름)"""
+    logger.info(f"[API] fetch_generation 호출 | baseDate={date}")
+
     # 사전 날짜 유효성 체크 (미래/과거 1년 초과 시 API 호출 안 함)
     err_msg = _validate_date(date)
     if err_msg:
-        print(f"[발전량 날짜 체크] {err_msg}")
+        logger.warning(f"[API] 발전량 날짜 체크 실패 | {err_msg}")
         return pd.DataFrame(columns=["date", "hour", "source", "gen_mw"])
 
     params = {
@@ -108,7 +117,7 @@ def fetch_generation(date: str) -> pd.DataFrame:
     }
     items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
     if not items:
-        print(f"[발전량 파싱] {date} 데이터 없음")
+        logger.warning(f"[API] 발전량 응답 없음 | baseDate={date}")
         return pd.DataFrame(columns=["date", "hour", "source", "gen_mw"])
     rows = []
     for item in items:
@@ -121,23 +130,31 @@ def fetch_generation(date: str) -> pd.DataFrame:
                 "source": source_name,
                 "gen_mw": float(item.get(field, 0))
             })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    logger.info(f"[API] 발전량 응답 수신 | {len(SOURCE_MAP)}개 발전원 | {df['hour'].nunique()}개 시간대")
+    for source_name in SOURCE_MAP.values():
+        avg_mw = df.loc[df["source"] == source_name, "gen_mw"].mean()
+        logger.info(f"[API]   {source_name}: {avg_mw:,.0f} MW (일평균)")
+    return df
 
 
 def fetch_current_demand() -> pd.DataFrame:
     """현재 전력수급현황 조회 (실시간, 캐시 미적용)"""
+    logger.info("[API] fetch_current_demand 호출")
     data = _call_api(
         "https://openapi.kpx.or.kr/openapi/sukub5mToday/getSukub5mToday",
         {}
     )
     items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
     if not items:
-        print("[수급현황 파싱] 데이터 없음")
+        logger.warning("[API] 수급현황 응답 없음")
         return pd.DataFrame(columns=["datetime", "demand_mw", "supply_mw", "reserve_mw", "reserve_rate"])
     item = items[0] if isinstance(items, list) else items
+    demand_mw = float(item.get("curr", 0))
+    logger.info(f"[API] 수급현황 수신 | 수요={demand_mw:,.0f} MW")
     return pd.DataFrame([{
         "datetime": item.get("baseDatetime", ""),
-        "demand_mw": float(item.get("curr", 0)),
+        "demand_mw": demand_mw,
         "supply_mw": float(item.get("suppAbility", 0)),
         "reserve_mw": float(item.get("suppReserve", 0)),
         "reserve_rate": float(item.get("suppReserveRate", 0))
