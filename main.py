@@ -8,7 +8,7 @@ from config.logging_config import setup_logging
 setup_logging()
 
 import streamlit as st
-from presentation.sidebar import render_sidebar, show_instructions
+from presentation.sidebar import render_sidebar, show_instructions, is_indexing_running
 from presentation.chat_ui import render_chat_ui, render_conversation_sidebar
 from presentation.chart_view import render_chart_view
 from application.graph_router import get_graph_router
@@ -282,9 +282,11 @@ def main():
     # 라이트 테마 CSS 주입
     st.markdown(LIGHT_CSS, unsafe_allow_html=True)
 
-    # 상단 실시간 지표 카드
-    render_top_metrics()
-    st.divider()
+    # 상단 실시간 지표 카드 (인덱싱 중에는 0.5초 간격 rerun마다
+    # 불필요한 실시간 수급현황 API 호출이 발생하므로 건너뛴다)
+    if not is_indexing_running():
+        render_top_metrics()
+        st.divider()
 
     # 사이드바 렌더링
     render_sidebar()

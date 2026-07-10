@@ -11,14 +11,90 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# PDF → 마크다운 변환 시 조문번호에 띄어쓰기가 삽입되는 경우가 있어 (예: "제 12.7.3.7 조")
+# 숫자/점/글자 사이 공백을 모두 허용하는 패턴을 사용한다.
+ARTICLE_PATTERN = r"제\s*\d+\s*\.\s*\d+(?:\s*\.\s*\d+)*\s*조"
+CHAPTER_PATTERN = r"제\s*\d+\s*장"
+SECTION_PATTERN = r"제\s*\d+\s*절"
+
+# 전력시장 전문용어 — 청크 텍스트에 등장하면 키워드로 자동 추출
+POWER_TERMS = [
+    "SMP", "계통한계가격", "급전순위", "발전량", "전력수요",
+    "예비력", "용량요금", "정산", "입찰", "변동비", "고정비",
+    "신재생", "원자력", "LNG", "유연탄", "태양광", "수력",
+    "한전", "전력거래소", "KPX", "계통운영", "부하차단",
+    "피크", "기저", "첨두", "최대수요", "최소수요",
+    "전력시장", "직접구매", "소규모", "분산형",
+    "가중평균", "한계발전기", "변동비용", "연료비",
+    "공급능력", "공급예비력", "수요예측", "수요반응"
+]
+
+
+def _normalize_article_num(raw: str) -> str:
+    """
+    띄어쓰기가 섞인 조문번호를 표준 형식으로 정규화
+    예: "제 12.7.3.7 조" → "제12.7.3.7조"
+        "제 2 . 4 . 1 조" → "제2.4.1조"
+    """
+    normalized = re.sub(r'\s+', '', raw)
+    return normalized
+
+
+def _extract_keywords(text: str) -> List[str]:
+    """청크 텍스트에서 전력시장 전문용어 추출"""
+    found = []
+    for term in POWER_TERMS:
+        if term in text:
+            found.append(term)
+    return found
+
+
+def _extract_article_title(text: str, article_num: str) -> str:
+    """
+    조문번호 다음 줄의 제목 추출
+    예: "제2.4.1조(계통한계가격의 산정)" → "계통한계가격의 산정"
+        "제2.4.1조 계통한계가격의 산정" → "계통한계가격의 산정"
+    """
+    # 조문번호 표기의 띄어쓰기를 정규화한 뒤 탐색해야 아래 정규식이 안정적으로 매칭된다
+    normalized_text = re.sub(
+        ARTICLE_PATTERN,
+        lambda m: _normalize_article_num(m.group()),
+        text
+    )
+
+    # 괄호 안 제목 패턴: 제X.X.X조(제목)
+    paren_match = re.search(
+        r'제\s*[\d.]+\s*조\s*[(\[（]([^)\]）]+)[)\]）]',
+        normalized_text
+    )
+    if paren_match:
+        title = paren_match.group(1).strip()
+        if len(title) >= 2:
+            return title
+
+    # 괄호 없이 바로 오는 제목 패턴: 제X.X.X조 제목
+    # 주의: "제X.X.X조 제5항의 규정..." 처럼 같은 조문 내 다른 항을 인용하는 경우,
+    # "제" 뒤에 숫자가 오면 문자 클래스가 거기서 멈춰 공백 포함 "제 " → strip 후 "제"만
+    # 남는 오탐이 발생한다. 2자 미만이면 제목이 아닌 것으로 판단해 버린다.
+    space_match = re.search(
+        r'제\s*[\d.]+\s*조\s+([가-힣a-zA-Z ]{2,20})',
+        normalized_text
+    )
+    if space_match:
+        title = space_match.group(1).strip()
+        if len(title) >= 2:
+            return title
+
+    return ""
+
 
 class Chunker:
     """문서 청킹 관리"""
-    
+
     def __init__(self, chunk_size: int = 500, overlap: int = 100, version: str = "2025-04-10"):
         """
         청커 초기화
-        
+
         Args:
             chunk_size (int): 청크 최대 크기
             overlap (int): 청크 간 중복 크기
@@ -27,57 +103,49 @@ class Chunker:
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.version = version
-    
+
     def chunk_document(self, content: str, filename: str) -> List[Dict]:
         """
         문서를 청크로 분할하고 메타데이터 추가
-        
+
         Args:
             content (str): 문서 내용
             filename (str): 파일명
-            
+
         Returns:
             List[Dict]: 청크 리스트 [{"text": str, "metadata": dict, "chunk_id": str}]
         """
         chunks = []
-        
-        # 조문 단위로 분할 시도 (제X.X.X조 패턴)
-        article_pattern = r'(제\d+\.\d+\.\d+조)'
-        articles = re.split(article_pattern, content)
-        
+        matches = list(re.finditer(ARTICLE_PATTERN, content))
         chunk_id = 0
-        current_text = ""
-        
-        for i, segment in enumerate(articles):
-            if re.match(r'제\d+\.\d+\.\d+조', segment):
-                # 조문번호
-                if current_text.strip():
-                    # 이전 청크 저장
-                    chunks.extend(self._create_chunks(
-                        current_text, chunk_id, filename, ""
-                    ))
-                    chunk_id += len(chunks)
-                
-                # 새로운 조문 시작
-                article_num = segment
-                current_text = segment + "\n"
-                
-                # 다음 내용 추가
-                if i + 1 < len(articles):
-                    current_text += articles[i + 1]
-                    i += 1
-            else:
-                current_text += segment
-        
-        # 마지막 청크 처리
-        if current_text.strip():
-            chunks.extend(self._create_chunks(
-                current_text, chunk_id, filename, ""
-            ))
-        
+
+        if not matches:
+            # 조문번호가 전혀 없는 문서(용어집/서식 등) — 통째로 크기 기반 분할
+            if content.strip():
+                chunks.extend(self._create_chunks(content, chunk_id, filename, ""))
+            logger.info(f"Created {len(chunks)} chunks from {filename}")
+            return chunks
+
+        # 첫 조문 이전 서문(목차/전문 등)은 조문번호 없이 별도 청크로 저장
+        preamble = content[:matches[0].start()]
+        if preamble.strip():
+            new_chunks = self._create_chunks(preamble, chunk_id, filename, "")
+            chunks.extend(new_chunks)
+            chunk_id += len(new_chunks)
+
+        for idx, match in enumerate(matches):
+            start = match.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            article_text = content[start:end]
+            article_num = _normalize_article_num(match.group())
+
+            new_chunks = self._create_chunks(article_text, chunk_id, filename, article_num)
+            chunks.extend(new_chunks)
+            chunk_id += len(new_chunks)
+
         logger.info(f"Created {len(chunks)} chunks from {filename}")
         return chunks
-    
+
     def _create_chunks(
         self,
         text: str,
@@ -87,23 +155,23 @@ class Chunker:
     ) -> List[Dict]:
         """
         텍스트를 크기 제한으로 분할
-        
+
         Args:
             text (str): 텍스트
             start_id (int): 시작 청크 ID
             filename (str): 파일명
             article_num (str): 조문번호
-            
+
         Returns:
             List[Dict]: 청크 리스트
         """
         chunks = []
-        
+
         # 단순 크기 기반 분할
         lines = text.split('\n')
         current_chunk = ""
         chunk_id = start_id
-        
+
         for line in lines:
             if len(current_chunk) + len(line) > self.chunk_size and current_chunk.strip():
                 chunks.append({
@@ -117,7 +185,7 @@ class Chunker:
                 chunk_id += 1
             else:
                 current_chunk += line + "\n"
-        
+
         # 마지막 청크
         if current_chunk.strip():
             chunks.append({
@@ -127,9 +195,9 @@ class Chunker:
                 ),
                 "chunk_id": f"{filename}_{chunk_id:04d}"
             })
-        
+
         return chunks
-    
+
     def _extract_metadata(
         self,
         chunk_text: str,
@@ -138,38 +206,49 @@ class Chunker:
     ) -> Dict:
         """
         청크에서 메타데이터 추출
-        
+
         Args:
             chunk_text (str): 청크 텍스트
             filename (str): 파일명
-            article_num (str): 조문번호
-            
+            article_num (str): 조문번호 (chunk_document에서 이미 정규화되어 전달됨)
+
         Returns:
             Dict: 메타데이터
         """
-        # 조문번호 추출 (제X.X.X조 패턴)
-        article_match = re.search(r'(제\d+\.\d+\.\d+조)', chunk_text)
-        조문번호 = article_match.group(1) if article_match else article_num
-        
-        # 장, 절 추출
+        # 조문번호 — 상위에서 전달되지 않은 경우 청크 텍스트에서 재탐색 (띄어쓰기 허용 + 정규화)
+        조문번호 = article_num
+        if not 조문번호:
+            article_match = re.search(ARTICLE_PATTERN, chunk_text)
+            조문번호 = _normalize_article_num(article_match.group()) if article_match else ""
+
+        # 장, 절 추출 — 기본은 조문번호에서 파생
         if 조문번호:
             parts = 조문번호.replace('제', '').replace('조', '').split('.')
             if len(parts) >= 2:
                 장번호 = f"제{parts[0]}장"
-                절번호 = f"제{parts[1]}절" if len(parts) > 1 else ""
+                절번호 = f"제{parts[1]}절"
             else:
                 장번호 = ""
                 절번호 = ""
         else:
             장번호 = ""
             절번호 = ""
-        
+
+        # 텍스트에 "제X장"/"제X절" 헤더가 직접 있으면 그 값을 우선 사용 (띄어쓰기 허용)
+        chapter_match = re.search(CHAPTER_PATTERN, chunk_text)
+        if chapter_match:
+            장번호 = re.sub(r'\s+', '', chapter_match.group())
+
+        section_match = re.search(SECTION_PATTERN, chunk_text)
+        if section_match:
+            절번호 = re.sub(r'\s+', '', section_match.group())
+
         return {
             "조문번호": 조문번호,
             "장번호": 장번호,
             "절번호": 절번호,
             "장제목": "",  # 별도 추출 필요
-            "조제목": "",
+            "조제목": _extract_article_title(chunk_text, 조문번호),
             "페이지": 0,
             "버전": self.version,
             "is_latest": True,
@@ -178,18 +257,18 @@ class Chunker:
             "개정이력": "[]",  # JSON 문자열
             "최초제정일": "2021-01-01",
             "개정횟수": 0,
-            "키워드": ""
+            "키워드": _extract_keywords(chunk_text)
         }
 
 
 def get_chunker(chunk_size: int = 500, overlap: int = 100) -> Chunker:
     """
     청커 인스턴스 반환
-    
+
     Args:
         chunk_size (int): 청크 최대 크기
         overlap (int): 청크 간 중복 크기
-        
+
     Returns:
         Chunker: 청커 인스턴스
     """

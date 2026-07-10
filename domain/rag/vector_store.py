@@ -14,6 +14,7 @@ from pathlib import Path
 from functools import lru_cache
 import json
 import logging
+import time
 import uuid
 from typing import List, Dict, Optional
 from config.settings import get_settings
@@ -60,6 +61,7 @@ def get_qdrant_client() -> QdrantClient:
         return QdrantClient(
             url=settings.QDRANT_URL,
             api_key=settings.QDRANT_API_KEY or None,
+            timeout=60,  # 기본값(5초) → 60초로 늘리기
         )
     Path(settings.QDRANT_DB_PATH).mkdir(parents=True, exist_ok=True)
     return QdrantClient(path=settings.QDRANT_DB_PATH)
@@ -169,13 +171,15 @@ class VectorStore:
         embeddings: List[List[float]],
         ids: List[str],
         metadatas: List[Dict],
-        batch_size: int = 100,
+        batch_size: int = 500,
     ) -> int:
-        """사전 계산된 임베딩으로 Qdrant에 저장. batch_size개씩 배치 처리."""
+        """사전 계산된 임베딩으로 Qdrant에 저장. batch_size개씩 배치 처리하며
+        타임아웃 등으로 실패한 배치는 최대 3회 재시도한다."""
         logger.info(f"[QDRANT] 저장 시작 | 총 {len(documents):,}개")
         added = 0
-        for start in range(0, len(documents), batch_size):
-            end = min(start + batch_size, len(documents))
+        total = len(documents)
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
             points = []
             for i in range(start, end):
                 payload = {
@@ -190,12 +194,23 @@ class VectorStore:
                         payload=payload,
                     )
                 )
-            try:
-                self.client.upsert(collection_name=self.collection_name, points=points)
-                added += end - start
-                logger.info(f"[QDRANT] upsert {end}/{len(documents)} 완료")
-            except Exception as e:
-                logger.error(f"Qdrant 배치 저장 실패 ({start}~{end}): {e}", exc_info=True)
+
+            for attempt in range(3):
+                try:
+                    self.client.upsert(collection_name=self.collection_name, points=points)
+                    added += end - start
+                    logger.info(f"[QDRANT] upsert {end}/{total} 완료")
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        logger.warning(
+                            f"[QDRANT] upsert 실패 ({attempt + 1}/3회) 재시도 중: {e}"
+                        )
+                        time.sleep(2)
+                    else:
+                        logger.error(
+                            f"[QDRANT] upsert 최종 실패 ({start}~{end}): {e}"
+                        )
         logger.info(f"[QDRANT] 저장 완료 | 성공: {added:,}개")
         return added
 

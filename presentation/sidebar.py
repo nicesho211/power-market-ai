@@ -27,6 +27,11 @@ _IDX: dict = {
 }
 
 
+def is_indexing_running() -> bool:
+    """PDF 인덱싱이 배경 스레드에서 진행 중인지 여부"""
+    return _IDX["running"]
+
+
 def render_sidebar():
     """사이드바 렌더링"""
     with st.sidebar:
