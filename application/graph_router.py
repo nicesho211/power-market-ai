@@ -45,22 +45,22 @@ def _format_diff_unavailable(result: Dict) -> str:
 # 사용 가능한 스킬 정의
 SKILLS: Dict[str, Dict] = {
     "rag_skill": {
-        "description": "전력시장운영규칙 조문 검색 및 Q&A",
+        "description": "전력시장운영규칙 현행 조문 검색 및 Q&A. 규정 내용/방식/기준/정의를 찾을 때 사용",
         "node": "rag_node",
         "output_field": "rag_result",
     },
     "analysis_skill": {
-        "description": "SMP/발전량/수요 데이터 수집 및 방향성 분석",
+        "description": "SMP/발전원별 발전량/예측전력수요 실제 데이터 수집 및 분석. 현재 수치/방향성/원인/패턴 분석 시 사용",
         "node": "analysis_fixed_node",
         "output_field": "analysis_result",
     },
     "diff_skill": {
-        "description": "규정 개정 전/후 조문 비교",
+        "description": "전력시장운영규칙 두 버전 간 개정 전/후 조문 비교. 개정 내용/변경사항 확인 시 사용",
         "node": "rag_diff_node",
         "output_field": "rag_result",
     },
     "history_skill": {
-        "description": "특정 조문의 전체 개정 이력 조회",
+        "description": "특정 조문의 전체 개정 이력 조회. 특정 조문이 언제 몇 번 바뀌었는지 확인 시 사용",
         "node": "rag_history_node",
         "output_field": "rag_result",
     },
@@ -488,8 +488,30 @@ class GraphRouter:
 
         return state
     
+    # SMP 방향성 스코어링을 트리거하는 키워드. 이 키워드가 없으면 일반 데이터 조회(Mode B)로 처리한다
+    # (예: "예비력 기준 초과했어?", "LNG 비중은?" 같은 질문이 항상 SMP 방향성 스코어만
+    #  받아 질문과 무관한 답변이 나오던 경직성 문제를 해결하기 위해 추가)
+    _SMP_DIRECTION_KEYWORDS = [
+        "방향성", "방향", "올랐어", "내렸어", "상승", "하락",
+        "보합", "전망", "추정", "브리핑"
+    ]
+
     def _analysis_fixed_node(self, state: AgentState) -> AgentState:
-        """SMP 방향성 추정 (정형 파이프라인) — 다중 날짜 지원"""
+        """정형 데이터 분석 진입점.
+
+        Mode A: SMP 방향성 스코어링 (query에 방향성 관련 키워드가 있을 때, 기존 로직 그대로)
+        Mode B: 그 외 일반 데이터 조회 (LNG 비중, 예비력 초과 여부 등 — 실제 데이터를 가져와
+                LLM이 질문에 맞춰 답변, 방향성 스코어에 억지로 끼워맞추지 않음)
+        """
+        query = state.get("query", "")
+        is_direction_query = any(kw in query for kw in self._SMP_DIRECTION_KEYWORDS)
+
+        if is_direction_query:
+            return self._run_smp_direction_scoring(state)
+        return self._run_general_data_query(state)
+
+    def _run_smp_direction_scoring(self, state: AgentState) -> AgentState:
+        """SMP 방향성 추정 (정형 파이프라인) — 다중 날짜 지원. (기존 _analysis_fixed_node 로직 그대로)"""
         logger.info("[ANALYSIS] 날짜 계산 시작")
 
         try:
@@ -610,7 +632,118 @@ class GraphRouter:
             })
 
         return state
-    
+
+    def _run_general_data_query(self, state: AgentState) -> AgentState:
+        """SMP 방향성 스코어링 대상이 아닌 일반 데이터 질의 처리.
+        (예: "현재 LNG 발전 비중은?", "현재 전력수요가 예비력 기준 초과했어?")
+        실제 API로 데이터를 수집하고 LLM이 질문에 맞춰 답변한다."""
+        from domain.analysis.mcp_client import fetch_smp, fetch_generation, fetch_current_demand
+
+        query = state.get("query", "")
+
+        try:
+            date_filter = state.get("date_filter") or {"period_type": "today"}
+            date_list = resolve_date_range(date_filter)
+            if not date_list:
+                date_list = [datetime.now().strftime("%Y%m%d")]
+            dates = date_list[-7:]  # 최대 최근 7일
+
+            state["progress_steps"].append({
+                "step": len(state["progress_steps"]) + 1,
+                "name": "데이터 수집",
+                "status": "진행중",
+                "detail": f"기간: {dates[0]} ~ {dates[-1]} ({len(dates)}일)"
+            })
+
+            smp_dfs, gen_dfs = [], []
+            for date in dates:
+                sdf = fetch_smp(date)
+                gdf = fetch_generation(date)
+                if not sdf.empty:
+                    smp_dfs.append(sdf)
+                if not gdf.empty:
+                    gen_dfs.append(gdf)
+            demand_df = fetch_current_demand()
+
+            if not smp_dfs and not gen_dfs and demand_df.empty:
+                state["error"] = {
+                    "node": "analysis_fixed_node",
+                    "stage": "데이터 수집",
+                    "reason": f"조회 기간({dates[0]}~{dates[-1]}) 데이터 없음 (공공데이터 API)",
+                    "recoverable": True,
+                    "message": "관련 데이터를 가져오지 못했습니다. 다른 기간으로 다시 시도해주시겠어요?"
+                }
+                state["progress_steps"].append({
+                    "step": len(state["progress_steps"]) + 1,
+                    "name": "데이터 수집",
+                    "status": "실패",
+                    "detail": "SMP/발전량/수급현황 데이터 전부 없음"
+                })
+                return state
+
+            data_summary_lines = []
+            if smp_dfs:
+                smp_df = pd.concat(smp_dfs, ignore_index=True)
+                data_summary_lines.append(f"SMP 평균: {smp_df['smp'].mean():.1f} 원/kWh")
+
+            if gen_dfs:
+                gen_df = pd.concat(gen_dfs, ignore_index=True)
+                gen_by_source = gen_df.groupby("source")["gen_mw"].mean()
+                total = gen_by_source.sum()
+                data_summary_lines.append("발전원별 평균 발전량 및 비중:")
+                for source, mw in gen_by_source.sort_values(ascending=False).items():
+                    pct = (mw / total * 100) if total > 0 else 0
+                    data_summary_lines.append(f"  {source}: {mw:,.0f}MW ({pct:.1f}%)")
+
+            if not demand_df.empty:
+                row = demand_df.iloc[0]
+                data_summary_lines.append(
+                    f"현재 전력수요: {row.get('demand_mw', 0):,.0f}MW / "
+                    f"공급능력: {row.get('supply_mw', 0):,.0f}MW / "
+                    f"예비력: {row.get('reserve_mw', 0):,.0f}MW "
+                    f"(예비율 {row.get('reserve_rate', 0):.1f}%)"
+                )
+
+            data_summary = "\n".join(data_summary_lines)
+
+            state["progress_steps"].append({
+                "step": len(state["progress_steps"]) + 1,
+                "name": "데이터 수집",
+                "status": "완료",
+                "detail": f"{dates[0]}~{dates[-1]} 데이터 수집 완료"
+            })
+
+            prompt = f"""질문: {query}
+
+[수집된 실제 데이터]
+{data_summary}
+
+위 실제 데이터를 바탕으로 질문에 정확하게 답해줘.
+수치를 직접 인용하면서 설명해줘.
+데이터에 없는 내용(예: 규정상 기준값)은 추정/확인 필요라고 명시해줘.
+"""
+            response = self.llm.invoke(prompt)
+            state["analysis_result"]["summary"] = response.content
+
+            state["progress_steps"].append({
+                "step": len(state["progress_steps"]) + 1,
+                "name": "데이터 조회 완료",
+                "status": "완료",
+                "detail": query[:30]
+            })
+
+        except Exception as e:
+            logger.error(f"General data query error: {e}")
+            state["error"] = {
+                "node": "analysis_fixed_node",
+                "stage": "데이터 조회",
+                "reason": str(e),
+                "recoverable": False,
+                "message": "데이터 조회 중 시스템 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+            }
+
+        return state
+
     def _analysis_plan_node(self, state: AgentState) -> AgentState:
         """비정형 데이터 분석 — multi_range(두 기간 이상 비교)는 실제 데이터 수집·비교,
         그 외는 LLM Planning (실패 시 Fixed Pipeline으로 폴백)"""
@@ -626,26 +759,27 @@ class GraphRouter:
             return self._analysis_plan_multi_range(state, date_result)
 
         try:
-            prompt = PromptManager.get_planning_analyzer_prompt()
-            formatted_prompt = prompt.format(user_query=state["query"])
-            response = self.llm_planning.invoke(formatted_prompt)
+            date_list = date_result if isinstance(date_result, list) else []
+            if not date_list:
+                from datetime import timedelta as _timedelta
+                today = datetime.now()
+                date_list = [
+                    (today - _timedelta(days=i)).strftime("%Y%m%d")
+                    for i in range(7, 0, -1)
+                ]
+                logger.info("[ANALYSIS_PLAN] 기간 특정 불가 → 최근 7일 기본값으로 원인 분석 진행")
 
-            if not response.content or len(response.content.strip()) < 10:
-                raise ValueError("LLM Planning 결과가 비정상입니다 (응답 너무 짧음)")
+            # 계획 텍스트만 생성하고 끝내지 않고, 실제 데이터를 수집해 원인을 분석한다
+            state = self._run_cause_analysis(state, date_list)
 
-            state["analysis_result"]["plan"] = response.content
-            state["progress_steps"].append({
-                "step": len(state["progress_steps"]) + 1,
-                "name": "분석 계획 수립",
-                "status": "완료",
-                "detail": "LLM Planning 완료"
-            })
+            if state.get("error"):
+                raise RuntimeError(state["error"].get("reason", "데이터 수집 실패"))
 
         except Exception as e:
             logger.warning(f"Analysis Plan node failed, falling back to fixed pipeline: {e}")
             state["progress_steps"].append({
                 "step": len(state["progress_steps"]) + 1,
-                "name": "분석 계획 수립",
+                "name": "원인 분석",
                 "status": "실패",
                 "detail": f"폴백 시도: {str(e)}"
             })
@@ -659,7 +793,7 @@ class GraphRouter:
                 state["error"] = {
                     "node": "analysis_plan_node",
                     "stage": "비정형 데이터 분석",
-                    "reason": f"LLM Planning 실패 및 Fixed 파이프라인 폴백도 실패: {str(e)}",
+                    "reason": f"원인 분석 실패 및 Fixed 파이프라인 폴백도 실패: {str(e)}",
                     "recoverable": True,
                     "message": "복잡한 분석에 실패해 기본 방식으로 재시도했지만 데이터를 가져오지 못했습니다."
                 }
@@ -670,6 +804,93 @@ class GraphRouter:
                     "status": "완료",
                     "detail": "Fixed Pipeline으로 전환 성공"
                 })
+
+        return state
+
+    def _run_cause_analysis(self, state: AgentState, date_list: List[str]) -> AgentState:
+        """analysis_plan_node의 단일 기간 경로 — 계획 텍스트만 생성하던 것을
+        실제 SMP/발전량 데이터 수집 + LLM 원인 분석 실행으로 대체한다."""
+        from domain.analysis.mcp_client import fetch_smp, fetch_generation
+
+        dates = date_list[-30:]  # 최대 30일
+
+        smp_dfs, gen_dfs = [], []
+        for date in dates:
+            sdf = fetch_smp(date)
+            gdf = fetch_generation(date)
+            if not sdf.empty:
+                smp_dfs.append(sdf)
+            if not gdf.empty:
+                gen_dfs.append(gdf)
+
+        if not smp_dfs:
+            state["error"] = {
+                "node": "analysis_plan_node",
+                "stage": "데이터 수집",
+                "reason": f"조회 기간({dates[0]}~{dates[-1]}) SMP 데이터 없음",
+                "recoverable": True,
+                "message": "해당 기간의 SMP 데이터를 가져오지 못했습니다. 다른 기간으로 다시 시도해주세요."
+            }
+            return state
+
+        smp_df = pd.concat(smp_dfs, ignore_index=True)
+        gen_df = pd.concat(gen_dfs, ignore_index=True) if gen_dfs else pd.DataFrame()
+
+        avg_smp = float(smp_df["smp"].mean())
+        max_smp = float(smp_df["smp"].max())
+        min_smp = float(smp_df["smp"].min())
+
+        gen_summary = ""
+        if not gen_df.empty and "source" in gen_df.columns:
+            gen_by_source = gen_df.groupby("source")["gen_mw"].mean()
+            total = gen_by_source.sum()
+            lines = []
+            for source, mw in gen_by_source.sort_values(ascending=False).items():
+                pct = (mw / total * 100) if total > 0 else 0
+                lines.append(f"{source}: {mw:,.0f}MW ({pct:.1f}%)")
+            gen_summary = "\n".join(lines)
+
+        state["progress_steps"].append({
+            "step": len(state["progress_steps"]) + 1,
+            "name": "데이터 수집",
+            "status": "완료",
+            "detail": f"기간: {dates[0]} ~ {dates[-1]} ({len(dates)}일) | SMP {len(smp_df)}건 수집"
+        })
+
+        prompt = f"""질문: {state.get('query', '')}
+
+[수집된 실제 데이터 — {dates[0]}~{dates[-1]}]
+SMP 평균: {avg_smp:.1f} 원/kWh
+SMP 최고: {max_smp:.1f} 원/kWh
+SMP 최저: {min_smp:.1f} 원/kWh
+발전원별 평균 발전량 및 비중:
+{gen_summary if gen_summary else "(발전량 데이터 없음)"}
+
+위 실제 데이터를 바탕으로 질문에 답해줘.
+추측이나 일반적인 설명이 아니라 위에 제시된 실제 수치를 근거로 인용해서 설명해줘.
+데이터에 없는 내용은 추정이라고 명시해줘.
+"""
+        try:
+            response = self.llm.invoke(prompt)
+            analysis_text = response.content
+        except Exception as e:
+            logger.error(f"원인 분석 LLM 호출 실패: {e}")
+            analysis_text = (
+                f"SMP 평균 {avg_smp:.1f}원/kWh, 최고 {max_smp:.1f}원/kWh, "
+                f"최저 {min_smp:.1f}원/kWh (자연어 요약 생성 실패)"
+            )
+
+        state["analysis_result"]["summary"] = analysis_text
+        state["analysis_result"]["avg_smp"] = round(avg_smp, 1)
+        state["analysis_result"]["max_smp"] = round(max_smp, 1)
+        state["analysis_result"]["min_smp"] = round(min_smp, 1)
+
+        state["progress_steps"].append({
+            "step": len(state["progress_steps"]) + 1,
+            "name": "원인 분석",
+            "status": "완료",
+            "detail": f"SMP 평균 {avg_smp:.1f}원/kWh 기준 분석 완료"
+        })
 
         return state
 
@@ -785,19 +1006,89 @@ class GraphRouter:
         """LLM이 질문을 분석해서 실행 계획을 수립하는 Node."""
         logger.info("[PLANNING] LLM Plan 수립 시작")
 
-        skills_desc = "\n".join(
-            f"- {name}: {info['description']}" for name, info in SKILLS.items()
-        )
         system_prompt = f"""당신은 전력시장 AI 어시스턴트의 실행 계획 수립 담당자입니다.
 사용자 질문을 분석해서 필요한 스킬과 실행 순서를 결정하세요.
 
-사용 가능한 스킬:
-{skills_desc}
+════════════════════════════════════
+■ 사용 가능한 스킬 4가지
+════════════════════════════════════
 
-병렬 실행 조건: 두 스킬이 서로의 결과에 의존하지 않을 때
-순차 실행 조건: 앞 스킬의 결과가 뒤 스킬의 입력으로 필요할 때
+rag_skill:
+  현행 전력시장운영규칙 조문 검색
+  → "방식", "기준", "규정", "절차", "정의", "뭐야?" 표현 시 사용
 
-반드시 아래 JSON 형식으로만 답하세요. 다른 텍스트 없이 JSON만:
+analysis_skill:
+  SMP/발전량/수요 실제 데이터 수집 및 분석
+  → "지금", "현재", "오늘", "어제", "수치", "얼마", "이유", "원인" 표현 시 사용
+
+diff_skill:
+  규정 개정 전/후 비교
+  → "개정", "바뀐 것", "달라진 것", "이번에 변경" 표현 시 사용
+  → rag_skill 대신 사용 (개정 비교는 diff_skill이 담당)
+
+history_skill:
+  특정 조문 개정 이력 조회
+  → 특정 조문번호 + "언제 바뀌었어", "개정 이력" 표현 시 사용
+  → rag_skill 대신 사용 (이력 조회는 history_skill이 담당)
+
+════════════════════════════════════
+■ 스킬 선택 필수 규칙
+════════════════════════════════════
+
+규칙 1. 실시간 데이터가 필요하면 → analysis_skill 반드시 포함
+  "지금", "현재", "오늘", "어제", "최근", "실제로" 표현
+
+규칙 2. 현행 규정 내용이 필요하면 → rag_skill 반드시 포함
+  "규정은", "기준이", "방식은", "절차는", "정의는" 표현
+  단, 개정 비교라면 diff_skill로 대체
+
+규칙 3. 데이터 + 현행 규정 동시 필요 → rag_skill + analysis_skill, parallel=true
+  "규정상 문제없어?", "기준 초과했어?", "맞는 수준이야?"
+  "데이터랑 규정으로", "근거로 설명해줘"
+
+규칙 4. 개정 비교 + 데이터 영향 → diff_skill + analysis_skill, parallel=true
+  "개정 내용이 실제로 영향 줬어?"
+  "바뀐 규정 후에 SMP가 어떻게 됐어?"
+
+규칙 5. 개정 이력 + 현행 내용 → history_skill + rag_skill, parallel=true
+  "이 조문 몇 번 바뀌었고 현재는 어떻게 돼?"
+
+규칙 6. parallel 기준
+  True: 두 스킬이 서로의 결과에 의존하지 않을 때 (대부분의 복합 질의)
+  False: 앞 스킬 결과가 뒤 스킬에 필요할 때 (거의 없음)
+
+════════════════════════════════════
+■ Few-Shot 예시
+════════════════════════════════════
+
+Q: "어제 SMP 급등 이유를 데이터랑 규정 근거로 설명해줘"
+→ skills=["rag_skill", "analysis_skill"], parallel=true
+   이유: 규정 근거(rag) + 실제 데이터 분석(analysis) 동시 필요
+
+Q: "지금 LNG 비중이 규정상 문제없는 수준이야?"
+→ skills=["rag_skill", "analysis_skill"], parallel=true
+   이유: 현행 LNG 규정(rag) + 현재 LNG 실측치(analysis) 둘 다 필요
+
+Q: "현재 전력수요가 예비력 기준 초과했어?"
+→ skills=["rag_skill", "analysis_skill"], parallel=true
+   이유: 예비력 기준 규정(rag) + 현재 수요 실측치(analysis) 둘 다 필요
+
+Q: "이번 개정 내용이 SMP에 실제로 영향 줬어?"
+→ skills=["diff_skill", "analysis_skill"], parallel=true
+   이유: 개정 전후 비교(diff) + 개정 전후 SMP 데이터 비교(analysis) 필요
+
+Q: "급전순위 규정 이번에 바뀐 거 있어?"
+→ skills=["diff_skill"], parallel=false
+   이유: 규정 개정 비교만 필요, 데이터 불필요
+
+Q: "제2.4.1조 언제 바뀌었고 현재 내용은?"
+→ skills=["history_skill", "rag_skill"], parallel=true
+   이유: 개정 이력(history) + 현행 조문 내용(rag) 동시 필요
+
+════════════════════════════════════
+■ 출력 형식 (JSON만, 다른 텍스트 없이)
+════════════════════════════════════
+
 {{
     "skills_needed": ["스킬명1", "스킬명2"],
     "parallel": true,
@@ -963,21 +1254,38 @@ class GraphRouter:
                 logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 return state
 
-            # 정상 출력 (기존 로직 유지)
-            if state.get("direction_result") and state["direction_result"].get("direction"):
-                output = self._format_direction_result(state["direction_result"])
-                summary = state.get("analysis_result", {}).get("summary", "")
+            # 정상 출력
+            rag_result = state.get("rag_result", "")
+            direction_result = state.get("direction_result") or {}
+            analysis_result = state.get("analysis_result") or {}
+            has_rag = bool(rag_result) and rag_result not in ("검색결과없음", "")
+            has_analysis = bool(direction_result.get("direction")) or bool(analysis_result)
+
+            # complex 등에서 rag_result와 analysis_result/direction_result가 모두 채워진 경우
+            # 규정 근거와 데이터 분석을 하나의 답변으로 통합 (한쪽만 보여주고 버리지 않도록)
+            if has_rag and has_analysis:
+                output = self._format_complex_answer(
+                    rag_result=rag_result,
+                    analysis_result=analysis_result,
+                    direction_result=direction_result,
+                    query=state.get("query", ""),
+                )
+            elif direction_result.get("direction"):
+                output = self._format_direction_result(direction_result)
+                summary = analysis_result.get("summary", "")
                 if summary:
                     output += f"\n\n🔄 분석 포인트\n{summary}"
-            elif state.get("rag_result") and state["rag_result"] not in ("검색결과없음", ""):
-                output = state["rag_result"]
-            elif state.get("analysis_result", {}).get("comparison"):
-                output = self._format_period_comparison(state["analysis_result"]["comparison"])
-                summary = state.get("analysis_result", {}).get("summary", "")
+            elif has_rag:
+                output = rag_result
+            elif analysis_result.get("comparison"):
+                output = self._format_period_comparison(analysis_result["comparison"])
+                summary = analysis_result.get("summary", "")
                 if summary:
                     output += f"\n\n🔄 분석 포인트\n{summary}"
-            elif state.get("analysis_result"):
-                output = str(state["analysis_result"])
+            elif analysis_result.get("summary"):
+                output = analysis_result["summary"]
+            elif analysis_result:
+                output = str(analysis_result)
             else:
                 output = "처리 결과를 생성하지 못했습니다."
 
@@ -1005,6 +1313,55 @@ class GraphRouter:
         logger.info(f"[FORMAT] 답변 생성 완료 | 소요시간: {elapsed}초")
         logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return state
+
+    def _format_complex_answer(
+        self,
+        rag_result: str,
+        analysis_result: Dict,
+        direction_result: Dict,
+        query: str,
+    ) -> str:
+        """규정 근거(rag_result) + 데이터 분석(analysis_result/direction_result)을
+        하나의 답변으로 통합. LLM을 한 번 더 호출해 두 결과를 자연스럽게 연결한다.
+
+        complex 질의에서 규정 검색과 데이터 분석이 모두 성공했는데도
+        format_output_node가 direction_result만 보여주고 rag_result를 버리던
+        병합 버그를 해결하기 위해 추가된 경로."""
+        data_summary = ""
+        if direction_result.get("direction"):
+            data_summary = (
+                f"방향성: {direction_result.get('direction')} "
+                f"{direction_result.get('direction_emoji', '')} "
+                f"({direction_result.get('score', 0)}/{direction_result.get('max_score', 3)}점)\n"
+                f"지표: {direction_result.get('indicators', {})}"
+            )
+            if analysis_result.get("summary"):
+                data_summary += f"\n분석 요약: {analysis_result['summary']}"
+        elif analysis_result:
+            data_summary = str(analysis_result)
+
+        prompt = f"""사용자 질문: {query}
+
+[데이터 분석 결과]
+{data_summary}
+
+[관련 규정 조문]
+{rag_result}
+
+위 두 가지 정보를 바탕으로 질문에 대한 통합 답변을 작성해줘.
+- 먼저 데이터 분석 결과를 설명하고
+- 그 다음 관련 규정 근거를 인용해서 설명해줘
+- 두 내용이 자연스럽게 연결되도록 작성해줘
+- 근거 없는 내용을 추가로 지어내지 말고, 위에 제공된 데이터/조문 범위 안에서만 답변해줘
+"""
+        try:
+            response = self.llm.invoke(prompt)
+            return response.content
+        except Exception as e:
+            logger.error(f"Complex answer merge failed: {e}")
+            # LLM 병합 실패 시에도 두 결과를 모두 보여주기 (최소한 데이터 유실은 없게)
+            direction_text = self._format_direction_result(direction_result) if direction_result.get("direction") else data_summary
+            return f"{direction_text}\n\n📖 관련 규정\n{rag_result}"
 
     def _format_direction_result(self, result: Dict) -> str:
         """방향성 결과 포맷팅"""
@@ -1060,7 +1417,8 @@ class GraphRouter:
             "answer": result.get("final_answer", ""),
             "intent": result.get("intent", ""),
             "progress": result.get("progress_steps", []),
-            "needs_clarification": result.get("needs_clarification", False)
+            "needs_clarification": result.get("needs_clarification", False),
+            "plan": result.get("plan"),
         }
 
 

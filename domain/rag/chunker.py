@@ -17,6 +17,10 @@ ARTICLE_PATTERN = r"제\s*\d+\s*\.\s*\d+(?:\s*\.\s*\d+)*\s*조"
 CHAPTER_PATTERN = r"제\s*\d+\s*장"
 SECTION_PATTERN = r"제\s*\d+\s*절"
 
+# 표/산식이 많은 조문 구간에서 다음 조문 경계가 정규식에 잡히지 않아 하나의 조문에
+# 청크가 과도하게 쌓이는 경우(과병합)를 막기 위한 상한. 초과분은 마지막 청크로 병합한다.
+MAX_CHUNKS_PER_ARTICLE = 10
+
 # 전력시장 전문용어 — 청크 텍스트에 등장하면 키워드로 자동 추출
 POWER_TERMS = [
     "SMP", "계통한계가격", "급전순위", "발전량", "전력수요",
@@ -38,6 +42,34 @@ def _normalize_article_num(raw: str) -> str:
     """
     normalized = re.sub(r'\s+', '', raw)
     return normalized
+
+
+def _split_table_blocks(text: str) -> List[Tuple[str, str]]:
+    """표/산식 블록("|"가 3개 이상인 줄이 연속되는 구간)을 일반 텍스트와 분리한다.
+    표 블록은 크기 제한과 무관하게 하나의 청크로 유지해 중간에 잘리지 않게 한다."""
+    lines = text.split("\n")
+    blocks: List[Tuple[str, str]] = []
+    current_block: List[str] = []
+    in_table = False
+
+    for line in lines:
+        is_table_line = line.count("|") >= 3
+        if is_table_line and not in_table:
+            if current_block:
+                blocks.append(("\n".join(current_block), "text"))
+                current_block = []
+            in_table = True
+        elif not is_table_line and in_table:
+            blocks.append(("\n".join(current_block), "table"))
+            current_block = []
+            in_table = False
+        current_block.append(line)
+
+    if current_block:
+        block_type = "table" if in_table else "text"
+        blocks.append(("\n".join(current_block), block_type))
+
+    return blocks
 
 
 def _extract_keywords(text: str) -> List[str]:
@@ -91,7 +123,7 @@ def _extract_article_title(text: str, article_num: str) -> str:
 class Chunker:
     """문서 청킹 관리"""
 
-    def __init__(self, chunk_size: int = 500, overlap: int = 100, version: str = "2025-04-10"):
+    def __init__(self, chunk_size: int = 800, overlap: int = 100, version: str = "2025-04-10"):
         """
         청커 초기화
 
@@ -166,34 +198,53 @@ class Chunker:
             List[Dict]: 청크 리스트
         """
         chunks = []
-
-        # 단순 크기 기반 분할
-        lines = text.split('\n')
-        current_chunk = ""
         chunk_id = start_id
+        current_chunk = ""
 
-        for line in lines:
-            if len(current_chunk) + len(line) > self.chunk_size and current_chunk.strip():
+        def _flush(text_to_flush: str) -> None:
+            nonlocal chunk_id
+            if text_to_flush.strip():
                 chunks.append({
-                    "text": current_chunk.strip(),
+                    "text": text_to_flush.strip(),
                     "metadata": self._extract_metadata(
-                        current_chunk, filename, article_num
+                        text_to_flush, filename, article_num
                     ),
                     "chunk_id": f"{filename}_{chunk_id:04d}"
                 })
-                current_chunk = line
                 chunk_id += 1
-            else:
-                current_chunk += line + "\n"
+
+        # 표/산식 블록은 별도로 분리해 크기 제한과 무관하게 하나의 청크로 유지한다
+        # (표 중간이 잘려 산식/컬럼 의미가 끊기는 것을 방지)
+        for block_text, block_type in _split_table_blocks(text):
+            if block_type == "table":
+                _flush(current_chunk)
+                current_chunk = ""
+                _flush(block_text)
+                continue
+
+            # 일반 텍스트 블록: 기존과 동일하게 줄 단위 크기 기반 분할
+            for line in block_text.split('\n'):
+                if len(current_chunk) + len(line) > self.chunk_size and current_chunk.strip():
+                    _flush(current_chunk)
+                    current_chunk = line
+                else:
+                    current_chunk += line + "\n"
 
         # 마지막 청크
-        if current_chunk.strip():
+        _flush(current_chunk)
+
+        # 조문당 청크 수 상한 — 표/산식 구간에서 다음 조문 경계 인식이 깨져 하나의
+        # 조문에 청크가 과도하게 쌓이는 경우, 초과분을 마지막 청크로 병합한다.
+        if len(chunks) > MAX_CHUNKS_PER_ARTICLE:
+            overflow_text = "\n\n".join(
+                c["text"] for c in chunks[MAX_CHUNKS_PER_ARTICLE - 1:]
+            )
+            merged_chunk_id = chunks[MAX_CHUNKS_PER_ARTICLE - 1]["chunk_id"]
+            chunks = chunks[:MAX_CHUNKS_PER_ARTICLE - 1]
             chunks.append({
-                "text": current_chunk.strip(),
-                "metadata": self._extract_metadata(
-                    current_chunk, filename, article_num
-                ),
-                "chunk_id": f"{filename}_{chunk_id:04d}"
+                "text": overflow_text,
+                "metadata": self._extract_metadata(overflow_text, filename, article_num),
+                "chunk_id": merged_chunk_id
             })
 
         return chunks
@@ -261,7 +312,7 @@ class Chunker:
         }
 
 
-def get_chunker(chunk_size: int = 500, overlap: int = 100) -> Chunker:
+def get_chunker(chunk_size: int = 800, overlap: int = 100) -> Chunker:
     """
     청커 인스턴스 반환
 
