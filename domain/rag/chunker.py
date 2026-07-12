@@ -234,18 +234,23 @@ class Chunker:
         _flush(current_chunk)
 
         # 조문당 청크 수 상한 — 표/산식 구간에서 다음 조문 경계 인식이 깨져 하나의
-        # 조문에 청크가 과도하게 쌓이는 경우, 초과분을 마지막 청크로 병합한다.
+        # 조문에 청크가 과도하게 쌓이는 경우, 초과분을 하나로 뭉치지 않고 chunk_size
+        # 단위로 다시 분할한다. (하나로 뭉치면 수만 자짜리 거대 청크가 생겨 임베딩
+        # 품질이 오히려 나빠지므로, 개수 상한보다 "청크당 크기 제한"을 우선한다)
         if len(chunks) > MAX_CHUNKS_PER_ARTICLE:
             overflow_text = "\n\n".join(
                 c["text"] for c in chunks[MAX_CHUNKS_PER_ARTICLE - 1:]
             )
-            merged_chunk_id = chunks[MAX_CHUNKS_PER_ARTICLE - 1]["chunk_id"]
             chunks = chunks[:MAX_CHUNKS_PER_ARTICLE - 1]
-            chunks.append({
-                "text": overflow_text,
-                "metadata": self._extract_metadata(overflow_text, filename, article_num),
-                "chunk_id": merged_chunk_id
-            })
+
+            resplit_chunk = ""
+            for line in overflow_text.split('\n'):
+                if len(resplit_chunk) + len(line) > self.chunk_size and resplit_chunk.strip():
+                    _flush(resplit_chunk)
+                    resplit_chunk = line
+                else:
+                    resplit_chunk += line + "\n"
+            _flush(resplit_chunk)
 
         return chunks
 
