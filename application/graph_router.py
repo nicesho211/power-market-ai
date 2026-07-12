@@ -198,7 +198,9 @@ class GraphRouter:
         logger.info(f"[CHAT] 사용자 질문: {state['query']}")
 
         try:
-            classification = self.classifier.classify(state["query"])
+            classification = self.classifier.classify(
+                state["query"], state.get("conversation_history")
+            )
 
             state["intent"] = classification["intent"]
             state["confidence"] = classification["confidence"]
@@ -1379,19 +1381,63 @@ Q: "제2.4.1조 언제 바뀌었고 현재 내용은?"
             )
         return "\n".join(lines)
     
+    def _resolve_followup_query(self, query: str, conversation_history: List[Dict]) -> str:
+        """clarify(재질문) 직후의 짧은 후속 답변("지난 3일" 등)을 원래 보류 중이던
+        질문과 합쳐 하나의 완결된 질문으로 재구성한다.
+
+        문제: 직전 답변이 "어느 기간을 분석해드릴까요?" 같은 clarify 재질문이었을 때,
+        사용자가 "지난 3일"처럼 기간만 답하면 그 문장 단독으로는 주제(예: LNG 비중,
+        SMP 등)가 전혀 없어 intent 분류도, 이후 데이터 분석 프롬프트도 원래 질문을
+        전혀 알지 못한 채 처리되어 버린다. 직전 turn이 clarify였을 때만 원래 질문과
+        이번 답변을 합쳐 state["query"] 자체를 재구성함으로써, 분류/분석 양쪽 모두
+        하나의 완결된 질문을 보게 만든다.
+        """
+        if not conversation_history:
+            return query
+
+        # conversation_history 마지막이 이번 턴 사용자 메시지 자신이면 그 이전부터 탐색
+        history = conversation_history
+        if history and history[-1].get("role") == "user" and history[-1].get("content") == query:
+            history = history[:-1]
+
+        if not history or history[-1].get("role") != "assistant":
+            return query
+
+        last_assistant = history[-1]
+        if last_assistant.get("intent") != "clarify":
+            return query
+
+        # clarify를 유발한 직전 사용자 질문을 원래 질문으로 간주
+        for msg in reversed(history[:-1]):
+            if msg.get("role") == "user":
+                original_question = msg.get("content", "")
+                if original_question and original_question != query:
+                    merged = f"{original_question} ({query})"
+                    logger.info(
+                        f"[FOLLOWUP] clarify 후속 답변 병합: '{query}' + "
+                        f"'{original_question}' -> '{merged}'"
+                    )
+                    return merged
+                break
+
+        return query
+
     def run(self, query: str, conversation_history: List = None) -> Dict:
         """
         워크플로우 실행
-        
+
         Args:
             query (str): 사용자 질문
             conversation_history (List): 대화 이력
-            
+
         Returns:
             Dict: 최종 답변
         """
+        conversation_history = conversation_history or []
+        effective_query = self._resolve_followup_query(query, conversation_history)
+
         initial_state = AgentState(
-            query=query,
+            query=effective_query,
             intent="",
             confidence=0.0,
             search_filter={},
