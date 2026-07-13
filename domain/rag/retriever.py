@@ -219,16 +219,51 @@ class Retriever:
             return []
 
     def search_by_regulation_number(self, regulation_num: str) -> List[Dict]:
-        """조문번호로 규정 검색"""
+        """조문번호로 정확히 해당 조문만 검색.
+
+        벡터 유사도 검색이 아닌 Qdrant 메타데이터 정확 필터(조문번호 exact match)를
+        사용한다. is_latest 제한 없이 모든 버전에서 조회해 개정 이력 조회에도
+        사용할 수 있게 한다.
+        """
+        import re
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        from domain.rag.vector_store import get_qdrant_client
+
+        normalized = re.sub(r"\s+", "", regulation_num)
+        settings = get_settings()
+        client = get_qdrant_client()
+        name = settings.QDRANT_COLLECTION_NAME
+
+        qdrant_filter = Filter(
+            must=[FieldCondition(key="조문번호", match=MatchValue(value=normalized))]
+        )
+
+        docs: List[Dict] = []
+        offset = None
         try:
-            return self.vector_store.search(
-                query=regulation_num,
-                top_k=10,
-                where={"is_latest": True},
-            )
+            while True:
+                points, next_offset = client.scroll(
+                    collection_name=name,
+                    scroll_filter=qdrant_filter,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=100,
+                    offset=offset,
+                )
+                for point in points:
+                    payload = dict(point.payload)
+                    text = payload.pop("document", "")
+                    payload.pop("_original_id", None)
+                    docs.append({"document": text, "metadata": payload})
+                if next_offset is None:
+                    break
+                offset = next_offset
         except Exception as e:
             logger.error(f"Search by regulation number failed: {e}")
             return []
+
+        docs.sort(key=lambda d: d["metadata"].get("버전", ""))
+        return docs
 
     def search_with_filters(
         self,
