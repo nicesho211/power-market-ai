@@ -108,8 +108,14 @@ def _ensure_payload_indexes(client: QdrantClient, name: str) -> None:
             logger.debug(f"[Qdrant] payload 인덱스 생성 스킵 ({field_name}): {e}")
 
 
+@lru_cache(maxsize=1)
 def get_collection_stats() -> dict:
-    """총 청크 수, 버전 목록, 최신 버전 반환"""
+    """총 청크 수, 버전 목록, 최신 버전 반환.
+
+    컬렉션 전체를 scroll()로 순회하는 비용이 커서(수천~수만 포인트) 캐싱한다.
+    사이드바가 렌더링될 때마다(즉 사용자가 뭘 클릭하든 매번) 호출되므로
+    캐시 없이는 모든 인터랙션마다 컬렉션 전체를 다시 훑게 된다.
+    인덱싱 완료/초기화 시 cache_clear()로 무효화한다."""
     settings = get_settings()
     client = get_qdrant_client()
     name = settings.QDRANT_COLLECTION_NAME
@@ -456,9 +462,10 @@ def reset_collection() -> None:
     import shutil
     settings = get_settings()
 
-    # ① 싱글톤 캐시 무효화 (클라이언트/스토어 모두)
+    # ① 싱글톤 캐시 무효화 (클라이언트/스토어/통계 모두)
     get_qdrant_client.cache_clear()
     get_vector_store.cache_clear()
+    get_collection_stats.cache_clear()
 
     # ② 디렉토리 삭제 (클라우드 모드에서는 컬렉션만 삭제)
     if not settings.QDRANT_URL:

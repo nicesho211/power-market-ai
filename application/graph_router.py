@@ -373,6 +373,11 @@ class GraphRouter:
             latest_v    = result["latest_version"]
             prev_v      = result["prev_version"]
 
+            logger.info(
+                f"[RAG] 버전 자동 탐지 | latest={latest_v} prev={prev_v} | "
+                f"latest_docs={len(latest_docs)}건 prev_docs={len(prev_docs)}건"
+            )
+
             latest_text = "\n\n".join(d["document"] for d in latest_docs) if latest_docs else "(검색 결과 없음)"
             prev_text   = "\n\n".join(d["document"] for d in prev_docs)   if prev_docs   else "(검색 결과 없음)"
 

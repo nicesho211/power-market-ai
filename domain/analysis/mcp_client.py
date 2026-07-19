@@ -90,6 +90,7 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
     """
     cache_key = (date, area)
     if cache_key in _SMP_CACHE:
+        logger.info(f"[API] SMP 캐시 재사용 | date={date}")
         return _SMP_CACHE[cache_key]
 
     if _is_fail_cached(_SMP_FAIL_CACHE, cache_key):
@@ -100,6 +101,7 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
         logger.warning(f"[SMP 날짜 체크] {err_msg}")
         return pd.DataFrame(columns=["date", "hour", "smp", "region", "forecast_demand"])
 
+    logger.info(f"[API] fetch_smp 호출 | date={date}")
     params = {
         "pageNo": 1,
         "numOfRows": 24,
@@ -129,6 +131,7 @@ def fetch_smp(date: str, area: str = "01") -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
+    logger.info(f"[API] SMP 응답 수신 | date={date} | {len(df)}개 시간대")
     if not df.empty:
         _SMP_CACHE[cache_key] = df  # 성공 결과만 캐시
         _SMP_FAIL_CACHE.pop(cache_key, None)
@@ -148,6 +151,7 @@ def fetch_generation(date: str) -> pd.DataFrame:
         source: 수력, 유류, 유연탄, 원자력, 양수, LNG, 국내탄, 신재생, 태양광
     """
     if date in _GEN_CACHE:
+        logger.info(f"[API] 발전량 캐시 재사용 | date={date}")
         return _GEN_CACHE[date]
 
     if _is_fail_cached(_GEN_FAIL_CACHE, date):
@@ -158,6 +162,7 @@ def fetch_generation(date: str) -> pd.DataFrame:
         logger.warning(f"[발전량 날짜 체크] {err_msg}")
         return pd.DataFrame(columns=["date", "hour", "source", "gen_mw"])
 
+    logger.info(f"[API] fetch_generation 호출 | date={date}")
     params = {
         "pageNo": 1,
         "numOfRows": 24,
@@ -202,6 +207,7 @@ def fetch_generation(date: str) -> pd.DataFrame:
             })
 
     df = pd.DataFrame(rows)
+    logger.info(f"[API] 발전량 응답 수신 | date={date} | {len(df)}행")
     if not df.empty:
         _GEN_CACHE[date] = df  # 성공 결과만 캐시
         _GEN_FAIL_CACHE.pop(date, None)
@@ -218,8 +224,10 @@ def fetch_current_demand() -> pd.DataFrame:
     """
     cached_at = _DEMAND_CACHE.get("at")
     if cached_at and (datetime.now() - cached_at).total_seconds() < _DEMAND_CACHE_TTL_SECONDS:
+        logger.info("[API] 수급현황 캐시 재사용")
         return _DEMAND_CACHE["data"]
 
+    logger.info("[API] fetch_current_demand 호출")
     data = _call_api(
         "https://openapi.kpx.or.kr/openapi/sukub5mToday/getSukub5mToday",
         {}

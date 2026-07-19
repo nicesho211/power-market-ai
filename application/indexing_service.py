@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config.settings import get_settings
 from domain.rag.document_loader import get_document_loader, detect_document_type
 from domain.rag.chunker import get_chunker
-from domain.rag.vector_store import get_vector_store
+from domain.rag.vector_store import get_vector_store, get_collection_stats
 
 logger = logging.getLogger("INDEX")
 
@@ -272,6 +272,7 @@ def run_indexing_stream(
         if detection_rate < 0.5:
             msg += f"\n⚠️ 조문 감지율 낮음 ({detection_rate:.1%})"
 
+        get_collection_stats.cache_clear()  # 사이드바 캐시된 통계 갱신
         yield {
             "type": "result", "success": True,
             "message": msg,

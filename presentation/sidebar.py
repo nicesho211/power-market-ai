@@ -10,7 +10,7 @@ import streamlit as st
 import threading
 import time
 from config.settings import validate_settings
-from domain.rag.vector_store import ensure_collection, get_collection_stats
+from domain.rag.vector_store import get_collection_stats
 import logging
 
 logger = logging.getLogger(__name__)
@@ -55,8 +55,11 @@ def render_sidebar():
         st.markdown("---")
 
         # ── 인덱싱 상태 카드 ──────────────────────────────────────────────
+        # ensure_collection()은 main.py의 init_resources()(st.cache_resource)에서
+        # 앱 시작 시 이미 한 번 보장됨. 여기서 매 rerun마다 다시 부르면
+        # get_collections()+count()+인덱스 생성 4회를 클릭할 때마다 반복하게 되어
+        # 인터랙션이 느려진다 — 제거하고 캐시된 통계만 조회한다.
         try:
-            ensure_collection()
             stats = get_collection_stats()
             if stats["total_chunks"] > 0:
                 st.markdown(f"""

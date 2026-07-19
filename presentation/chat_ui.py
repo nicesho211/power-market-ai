@@ -89,9 +89,11 @@ def render_chat_ui(router):
                         "intent": result.get("intent", ""),
                         "timestamp": datetime.now().isoformat()
                     })
-                    
-                    st.rerun()
-                    
+                    # 위에서 이미 답변을 인라인으로 렌더링했으므로 st.rerun()은 불필요.
+                    # 매 메시지마다 전체 스크립트를 한 번 더 재실행(상단 지표 API 재호출,
+                    # 사이드바 재조회 등)하던 것이 응답 후 화면이 깜빡이며 느려지는
+                    # 주된 원인이었다.
+
                 except Exception as e:
                     error_msg = f"❌ 오류 발생: {str(e)}\n\n다시 시도해주세요."
                     st.error(error_msg)

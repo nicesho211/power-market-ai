@@ -5,6 +5,7 @@ DB 저장 없이 즉시 처리 후 반환합니다.
 """
 
 import logging
+import time
 import requests
 import pandas as pd
 from functools import lru_cache
@@ -12,6 +13,9 @@ from datetime import datetime, timedelta
 from config.settings import get_settings
 
 logger = logging.getLogger("API")
+
+_DEMAND_CACHE_TTL = 30  # 초 — KPX 수급현황 자체가 5분 주기 갱신이라 짧은 TTL로 충분
+_demand_cache: tuple[float, pd.DataFrame] | None = None
 
 
 def _call_api(base_url: str, params: dict) -> dict:
@@ -139,7 +143,19 @@ def fetch_generation(date: str) -> pd.DataFrame:
 
 
 def fetch_current_demand() -> pd.DataFrame:
-    """현재 전력수급현황 조회 (실시간, 캐시 미적용)"""
+    """현재 전력수급현황 조회 (짧은 TTL 캐시 적용).
+
+    사이드바/상단 지표 카드가 매 Streamlit rerun(=사용자 클릭 한 번)마다
+    이 함수를 부르므로, 캐시 없이는 클릭할 때마다 외부 API 왕복이 발생해
+    화면이 느려진다. KPX 수급현황 자체가 5분 주기 갱신이라 30초 TTL로도
+    체감 실시간성은 유지된다."""
+    global _demand_cache
+    now = time.monotonic()
+    if _demand_cache is not None:
+        cached_at, cached_df = _demand_cache
+        if now - cached_at < _DEMAND_CACHE_TTL:
+            return cached_df
+
     logger.info("[API] fetch_current_demand 호출")
     data = _call_api(
         "https://openapi.kpx.or.kr/openapi/sukub5mToday/getSukub5mToday",
@@ -148,14 +164,18 @@ def fetch_current_demand() -> pd.DataFrame:
     items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
     if not items:
         logger.warning("[API] 수급현황 응답 없음")
-        return pd.DataFrame(columns=["datetime", "demand_mw", "supply_mw", "reserve_mw", "reserve_rate"])
+        result = pd.DataFrame(columns=["datetime", "demand_mw", "supply_mw", "reserve_mw", "reserve_rate"])
+        _demand_cache = (now, result)
+        return result
     item = items[0] if isinstance(items, list) else items
     demand_mw = float(item.get("curr", 0))
     logger.info(f"[API] 수급현황 수신 | 수요={demand_mw:,.0f} MW")
-    return pd.DataFrame([{
+    result = pd.DataFrame([{
         "datetime": item.get("baseDatetime", ""),
         "demand_mw": demand_mw,
         "supply_mw": float(item.get("suppAbility", 0)),
         "reserve_mw": float(item.get("suppReserve", 0)),
         "reserve_rate": float(item.get("suppReserveRate", 0))
     }])
+    _demand_cache = (now, result)
+    return result

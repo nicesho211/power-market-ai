@@ -56,3 +56,8 @@ logs/
 
 # LangSmith
 .langchain/
+
+# 데모 영상 제작 산출물 (용량 큼, 재생성 가능)
+demo_output/
+demo_console.log
+demo_script_*.log

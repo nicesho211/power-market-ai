@@ -19,6 +19,15 @@ def setup_logging():
     log_format = "[%(asctime)s] [%(name)s] %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
 
+    if sys.platform == "win32":
+        # Windows 콘솔 기본 cp949 인코딩에서 로그 메시지의 이모지(⚡✅⚠️ 등) 출력 시
+        # UnicodeEncodeError로 로깅 자체가 깨지는 것을 방지
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     # 루트 로거 설정 (콘솔 핸들러)
